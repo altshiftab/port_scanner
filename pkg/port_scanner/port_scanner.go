@@ -124,6 +124,13 @@ func ScanNetworks(
 	callback func(*Result),
 	options ...port_scanner_config.Option,
 ) error {
+	// Checked here rather than left to the scan loops: with a small target set
+	// the concurrency limit is never reached, so a loop that only notices
+	// cancellation while waiting for a slot would not notice it at all.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("ctx err: %w", err)
+	}
+
 	if len(networks) == 0 {
 		return altshiftErrors.NewWithTrace(
 			fmt.Errorf("%w: %w", altshiftErrors.ErrValidationError, empty_error.New("networks")),
