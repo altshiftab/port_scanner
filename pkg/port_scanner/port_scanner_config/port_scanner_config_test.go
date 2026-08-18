@@ -17,20 +17,22 @@ func TestNew(t *testing.T) {
 		{
 			name: "defaults",
 			want: &Config{
-				Concurrency:   DefaultConcurrency,
-				Timeout:       DefaultTimeout,
-				SendAttempts:  DefaultSendAttempts,
-				SendRetryWait: DefaultSendRetryWait,
+				Concurrency:    DefaultConcurrency,
+				Timeout:        DefaultTimeout,
+				SendAttempts:   DefaultSendAttempts,
+				SendRetryWait:  DefaultSendRetryWait,
+				ConnectTimeout: DefaultConnectTimeout,
 			},
 		},
 		{
 			name:    "nil option is skipped",
 			options: []Option{nil},
 			want: &Config{
-				Concurrency:   DefaultConcurrency,
-				Timeout:       DefaultTimeout,
-				SendAttempts:  DefaultSendAttempts,
-				SendRetryWait: DefaultSendRetryWait,
+				Concurrency:    DefaultConcurrency,
+				Timeout:        DefaultTimeout,
+				SendAttempts:   DefaultSendAttempts,
+				SendRetryWait:  DefaultSendRetryWait,
+				ConnectTimeout: DefaultConnectTimeout,
 			},
 		},
 		{
@@ -51,16 +53,18 @@ func TestNew(t *testing.T) {
 				SendRetryWait:  time.Millisecond,
 				SkipIpv6:       true,
 				InterfaceNames: []string{"eth0", "wlan0", "wg0"},
+				ConnectTimeout: DefaultConnectTimeout,
 			},
 		},
 		{
 			name:    "later option wins",
 			options: []Option{WithConcurrency(1), WithConcurrency(2)},
 			want: &Config{
-				Concurrency:   2,
-				Timeout:       DefaultTimeout,
-				SendAttempts:  DefaultSendAttempts,
-				SendRetryWait: DefaultSendRetryWait,
+				Concurrency:    2,
+				Timeout:        DefaultTimeout,
+				SendAttempts:   DefaultSendAttempts,
+				SendRetryWait:  DefaultSendRetryWait,
+				ConnectTimeout: DefaultConnectTimeout,
 			},
 		},
 	}

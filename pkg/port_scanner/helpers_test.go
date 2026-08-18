@@ -6,13 +6,15 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
-	"github.com/gopacket/gopacket/pcap"
 )
+
+var errFakeSourceDrained = errors.New("fake packet source drained")
 
 // packetSpec describes a packet to build for a test.
 type packetSpec struct {
@@ -177,6 +179,7 @@ func buildPacket(t *testing.T, spec *packetSpec) []byte {
 // fakePacketSource hands out queued packets and behaves like an idle capture handle otherwise:
 // reads time out until it is closed, after which they report EOF.
 type fakePacketSource struct {
+	closed   atomic.Bool
 	linkType layers.LinkType
 	packets  chan []byte
 	done     chan struct{}
@@ -191,6 +194,8 @@ func newFakePacketSource(linkType layers.LinkType) *fakePacketSource {
 	}
 }
 
+func (source *fakePacketSource) Closed() bool { return source.closed.Load() }
+
 func (source *fakePacketSource) LinkType() layers.LinkType {
 	return source.linkType
 }
@@ -202,7 +207,8 @@ func (source *fakePacketSource) ReadPacketData() ([]byte, gopacket.CaptureInfo, 
 	case data := <-source.packets:
 		return data, gopacket.CaptureInfo{CaptureLength: len(data), Length: len(data)}, nil
 	case <-time.After(5 * time.Millisecond):
-		return nil, gopacket.CaptureInfo{}, pcap.NextErrorTimeoutExpired
+		source.closed.Store(true)
+		return nil, gopacket.CaptureInfo{}, errFakeSourceDrained
 	}
 }
 

@@ -6,6 +6,8 @@ import "errors"
 
 var (
 	ErrNotPrivileged           = errors.New("not privileged")
+	ErrPortOutOfRange          = errors.New("port out of range")
+	ErrTooManyAddresses        = errors.New("targets expand past the address cap")
 	ErrScanInProgress          = errors.New("scan in progress")
 	ErrTooManyTargets          = errors.New("too many targets")
 	ErrInvalidNetworkMask      = errors.New("invalid network mask")

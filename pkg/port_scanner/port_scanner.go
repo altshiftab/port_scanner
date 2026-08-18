@@ -145,6 +145,16 @@ func ScanNetworks(
 		return fmt.Errorf("validate config: %w", err)
 	}
 
+	// A connect scan opens ordinary outbound sockets, so it is the one mode that
+	// does not need the raw-socket privilege the check below insists on.
+	if config.Mode == port_scanner_config.ModeConnect {
+		if err := scanConnect(ctx, networks, ports, callback, config); err != nil {
+			return fmt.Errorf("scan connect: %w", err)
+		}
+
+		return nil
+	}
+
 	if !IsPrivileged() {
 		return altshiftErrors.NewWithTrace(portScannerErrors.ErrNotPrivileged)
 	}

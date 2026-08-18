@@ -480,6 +480,8 @@ type erroringPacketSource struct {
 	err error
 }
 
+func (source *erroringPacketSource) Closed() bool { return false }
+
 func (source *erroringPacketSource) LinkType() layers.LinkType { return layers.LinkTypeEthernet }
 func (source *erroringPacketSource) ReadPacketData() ([]byte, gopacket.CaptureInfo, error) {
 	return nil, gopacket.CaptureInfo{}, source.err

@@ -7,3 +7,5 @@ require (
 	github.com/gopacket/gopacket v1.7.1
 	golang.org/x/sys v0.47.0
 )
+
+require golang.org/x/net v0.58.0 // indirect

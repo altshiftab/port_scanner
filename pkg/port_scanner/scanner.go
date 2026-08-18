@@ -20,7 +20,6 @@ import (
 	"github.com/altshiftab/utils_go/pkg/errors/types/nil_error"
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
-	"github.com/gopacket/gopacket/pcap"
 
 	portScannerErrors "github.com/altshiftab/port_scanner/pkg/errors"
 	"github.com/altshiftab/port_scanner/pkg/port_scanner/port_scanner_config"
@@ -28,16 +27,21 @@ import (
 	"github.com/altshiftab/port_scanner/pkg/types/permutation"
 )
 
-// PacketSource is where a reader gets captured packets from. *pcap.Handle is one. ReadPacketData
-// must not block indefinitely: it has to return periodically with pcap.NextErrorTimeoutExpired
-// while nothing arrives, so that the reader can notice the scan is over, and with io.EOF once the
-// source is exhausted or closed. A pcap handle opened with a read timeout does both.
+// PacketSource is where a reader gets captured packets from; *CaptureHandle is one.
+//
+// A read blocks until a frame arrives or the source is closed. Closing it is
+// therefore how a reader is told the scan is over: the blocked read returns an
+// error, which the reader treats as the end rather than a failure.
 type PacketSource interface {
 	ReadPacketData() ([]byte, gopacket.CaptureInfo, error)
 	LinkType() layers.LinkType
+
+	// Closed reports whether the source has been closed, which is how a reader
+	// tells an ended scan from a failed capture.
+	Closed() bool
 }
 
-var _ PacketSource = (*pcap.Handle)(nil)
+var _ PacketSource = (*CaptureHandle)(nil)
 
 // probe is an outstanding SYN: the target it went to and how to give its slot back.
 type probe struct {
@@ -464,8 +468,11 @@ func (scanner *Scanner) readReplies(ctx context.Context, packetSource PacketSour
 			if errors.Is(err, io.EOF) {
 				return nil
 			}
-			if errors.Is(err, pcap.NextErrorTimeoutExpired) {
-				continue
+			// A read returns only when a frame arrives or the source is
+			// closed, and closing it is how the scan is ended - so an error
+			// from a closed source is the expected way out, not a failure.
+			if packetSource.Closed() {
+				return nil
 			}
 
 			return altshiftErrors.NewWithTrace(fmt.Errorf("read packet data: %w", err))

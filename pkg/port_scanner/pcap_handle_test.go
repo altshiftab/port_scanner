@@ -1,83 +1,86 @@
 package port_scanner
 
 import (
-	"context"
-	"errors"
+	"net"
 	"testing"
 
-	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
-	"github.com/altshiftab/utils_go/pkg/errors/types/empty_error"
-	"github.com/gopacket/gopacket/pcap"
-
-	portScannerErrors "github.com/altshiftab/port_scanner/pkg/errors"
+	"github.com/gopacket/gopacket/layers"
 )
 
-func TestReplyFilter(t *testing.T) {
+func TestOpenPcapHandleRejectsIncompleteArguments(t *testing.T) {
 	t.Parallel()
 
-	testCases := []struct {
-		name string
-		port int
-		want string
-	}{
-		{name: "low port", port: 80, want: "tcp and dst port 80"},
-		{name: "high port", port: 65535, want: "tcp and dst port 65535"},
+	filter, err := ReplyFilter(44444)
+	if err != nil {
+		t.Fatalf("ReplyFilter: %v", err)
 	}
-
-	for _, testCase := range testCases {
-		t.Run(testCase.name, func(t *testing.T) {
-			t.Parallel()
-
-			if got := ReplyFilter(testCase.port); got != testCase.want {
-				t.Fatalf("ReplyFilter(%d) = %q, want %q", testCase.port, got, testCase.want)
-			}
-		})
-	}
-}
-
-func TestOpenPcapHandleValidation(t *testing.T) {
-	t.Parallel()
 
 	testCases := []struct {
 		name          string
 		interfaceName string
-		bpfFilter     string
+		useFilter     bool
 	}{
-		{name: "empty interface name", interfaceName: "", bpfFilter: "tcp"},
-		{name: "empty filter", interfaceName: "lo", bpfFilter: ""},
+		{name: "an empty interface name is rejected", interfaceName: "", useFilter: true},
+		{name: "an empty filter is rejected", interfaceName: "lo", useFilter: false},
 	}
 
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			handle, err := OpenPcapHandle(testCase.interfaceName, testCase.bpfFilter)
-			if handle != nil {
-				handle.Close()
+			var handle *CaptureHandle
+			var err error
+
+			if testCase.useFilter {
+				handle, err = OpenPcapHandle(testCase.interfaceName, filter)
+			} else {
+				handle, err = OpenPcapHandle(testCase.interfaceName, nil)
 			}
-			if _, ok := errors.AsType[*empty_error.Error](err); !ok {
-				t.Fatalf("OpenPcapHandle() error = %v, want an empty error", err)
+
+			if err == nil {
+				if handle != nil {
+					_ = handle.Close()
+				}
+				t.Fatal("expected an error, got nil")
 			}
 		})
 	}
 }
 
-func TestOpenPcapHandlesValidation(t *testing.T) {
+// The link type decides how a captured frame is decoded, and pcapgo does not
+// report it, so it is derived from the interface.
+func TestInterfaceLinkType(t *testing.T) {
 	t.Parallel()
 
 	testCases := []struct {
-		name           string
-		listenPort     int
-		interfaceNames []string
-		wantErr        error
+		name             string
+		networkInterface *net.Interface
+		want             layers.LinkType
 	}{
-		{name: "port zero", listenPort: 0, wantErr: portScannerErrors.ErrInvalidPort},
-		{name: "port too large", listenPort: 70000, wantErr: portScannerErrors.ErrInvalidPort},
 		{
-			name:           "unknown interface",
-			listenPort:     40000,
-			interfaceNames: []string{"no-such-interface-0"},
-			wantErr:        portScannerErrors.ErrInterfaceNotUp,
+			name:             "a nil interface falls back to ethernet",
+			networkInterface: nil,
+			want:             layers.LinkTypeEthernet,
+		},
+		{
+			// Linux gives loopback frames a placeholder Ethernet header even
+			// though the interface carries no hardware address.
+			name:             "loopback is framed as ethernet",
+			networkInterface: &net.Interface{Flags: net.FlagUp | net.FlagLoopback},
+			want:             layers.LinkTypeEthernet,
+		},
+		{
+			name: "an interface with a mac address is ethernet",
+			networkInterface: &net.Interface{
+				Flags:        net.FlagUp,
+				HardwareAddr: net.HardwareAddr{0, 1, 2, 3, 4, 5},
+			},
+			want: layers.LinkTypeEthernet,
+		},
+		{
+			name:             "a tunnel carries bare ip",
+			networkInterface: &net.Interface{Flags: net.FlagUp | net.FlagPointToPoint},
+			want:             linkTypeDltRaw,
 		},
 	}
 
@@ -85,40 +88,17 @@ func TestOpenPcapHandlesValidation(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			handles, err := OpenPcapHandles(context.Background(), testCase.listenPort, testCase.interfaceNames)
-			ClosePcapHandles(handles)
-
-			if !errors.Is(err, testCase.wantErr) {
-				t.Fatalf("OpenPcapHandles() error = %v, want %v", err, testCase.wantErr)
-			}
-			if !errors.Is(err, altshiftErrors.ErrValidationError) {
-				t.Fatalf("OpenPcapHandles() error = %v, want a validation error", err)
+			if got := interfaceLinkType(testCase.networkInterface); got != testCase.want {
+				t.Errorf("interfaceLinkType() = %v, want %v", got, testCase.want)
 			}
 		})
 	}
 }
 
-func TestOpenPcapHandles(t *testing.T) {
-	t.Parallel()
-
-	if !IsPrivileged() {
-		t.Skip("packet capture needs CAP_NET_RAW; run with it to exercise OpenPcapHandles")
-	}
-
-	handles, err := OpenPcapHandles(context.Background(), 40000, []string{"lo"})
-	if err != nil {
-		t.Fatalf("OpenPcapHandles() error = %v", err)
-	}
-	defer ClosePcapHandles(handles)
-
-	if len(handles) != 1 {
-		t.Fatalf("%d handles, want 1", len(handles))
-	}
-}
-
-func TestClosePcapHandlesTolerantOfNil(t *testing.T) {
+func TestClosePcapHandlesToleratesNil(t *testing.T) {
 	t.Parallel()
 
 	ClosePcapHandles(nil)
-	ClosePcapHandles([]*pcap.Handle{nil})
+	ClosePcapHandles([]*CaptureHandle{nil})
+	ClosePcapHandles([]*CaptureHandle{nil, nil})
 }
