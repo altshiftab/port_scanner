@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -129,12 +130,20 @@ func TestScanConnectFindsAListener(t *testing.T) {
 	closedPort := closedListener.Addr().(*net.TCPAddr).Port
 	_ = closedListener.Close()
 
+	// The callback runs on a goroutine per result, so the collection is guarded even though only
+	// one result is expected here: an unguarded append is a race whether or not it happens to be
+	// contended on the day.
+	var mutex sync.Mutex
 	var found []*Result
 	err = Scan(
 		t.Context(),
 		[]string{"127.0.0.1"},
 		[]int{openPort, closedPort},
-		func(result *Result) { found = append(found, result) },
+		func(result *Result) {
+			mutex.Lock()
+			defer mutex.Unlock()
+			found = append(found, result)
+		},
 		port_scanner_config.WithMode(port_scanner_config.ModeConnect),
 		port_scanner_config.WithConcurrency(8),
 		port_scanner_config.WithConnectTimeout(time.Second),

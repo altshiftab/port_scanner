@@ -2,15 +2,20 @@ package port_scanner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
+	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
+
+	"github.com/altshiftab/port_scanner/pkg/banner"
 	portScannerErrors "github.com/altshiftab/port_scanner/pkg/errors"
 	"github.com/altshiftab/port_scanner/pkg/port_scanner/port_scanner_config"
-	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
 )
 
 // maxConnectAddresses caps how many addresses one connect scan will enumerate.
@@ -42,6 +47,11 @@ func scanConnect(
 	semaphore := make(chan struct{}, config.Concurrency)
 	var waitGroup sync.WaitGroup
 
+	// probes counts what was launched and localFailures what never reached the network, so that a
+	// scan which could not dial at all can say so rather than reporting nothing open.
+	probes := int64(len(addresses)) * int64(len(ports))
+	var localFailures atomic.Int64
+
 	for _, address := range addresses {
 		for _, port := range ports {
 			select {
@@ -56,29 +66,102 @@ func scanConnect(
 				defer waitGroup.Done()
 				defer func() { <-semaphore }()
 
-				if !connectOpen(ctx, address, port, config.ConnectTimeout) {
+				connection, err := connectOpen(ctx, address, port, config.ConnectTimeout)
+				if err != nil {
+					if isLocalFailure(err) {
+						localFailures.Add(1)
+					}
+
 					return
 				}
 
-				callback(&Result{
+				result := &Result{
 					IpAddress: address.String(),
 					Port:      port,
-					Transport: "tcp",
+					Transport: TransportTcp,
 					IpVersion: ipVersionOf(address),
-				})
+				}
+
+				// The connection the scan proved the port with is the one the banner is read from,
+				// so asking costs no second handshake -- which is the whole reason a connect scan
+				// is the cheap place to ask.
+				if config.Banner {
+					result.Banner = banner.Grab(ctx, connection, port, config.BannerOptions...)
+				}
+
+				_ = connection.Close()
+
+				callback(result)
 			}()
 		}
 	}
 
 	waitGroup.Wait()
 
+	// A dial that fails because the context ended is indistinguishable from a dial that failed
+	// because the port is shut, so a scan cut short reports every remaining port closed. Left
+	// unreported that is the one wrong answer nothing downstream can catch: a clean scan that
+	// found nothing. The context is therefore checked after the wait as well as in the loop, which
+	// only notices while waiting for a slot.
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("ctx err: %w", err)
+	}
+
+	// Every dial failing locally -- no file descriptors, no route, no permission -- is the same
+	// kind of lie: nothing was ever asked, and a scan that asked nothing has not found that
+	// nothing is open. SYN mode says so with ErrNoProbesSent and this says it the same way.
+	if probes > 0 && localFailures.Load() == probes {
+		return altshiftErrors.NewWithTrace(portScannerErrors.ErrNoProbesSent, probes)
+	}
+
 	return nil
 }
 
-// connectOpen reports whether a handshake to the address completes. Every way it
-// can fail - refused, filtered, unreachable, timed out - means the same thing to
-// a scan: not open.
-func connectOpen(ctx context.Context, address net.IP, port int, timeout time.Duration) bool {
+// isLocalFailure reports whether a dial failed before it ever reached the network: the file
+// descriptors ran out, there is no route, or the sandbox refused.
+//
+// It is the distinction between "the target did not answer" and "we never asked", which a connect
+// scan otherwise loses -- both arrive as a failed dial, and both would be read as a shut port.
+func isLocalFailure(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	// A dial the context ended is not a local failure in this sense; it is reported separately and
+	// would otherwise mask the check.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+
+	syscallError, ok := errors.AsType[syscall.Errno](err)
+	if !ok {
+		return false
+	}
+
+	switch syscallError {
+	case syscall.EMFILE, syscall.ENFILE, syscall.ENOBUFS, syscall.ENOMEM,
+		syscall.EPERM, syscall.EACCES, syscall.EAFNOSUPPORT,
+		syscall.ENETUNREACH, syscall.EADDRNOTAVAIL, syscall.EINVAL:
+		return true
+	default:
+		return false
+	}
+}
+
+// connectOpen returns the connection a completed handshake to the address left open.
+//
+// The error is returned rather than folded into "not open" because the ways a dial fails are not
+// all the same thing. Refused, filtered and timed out are answers about the port; out of file
+// descriptors or no route are answers about us, and the caller counts those separately.
+//
+// The connection is handed back rather than closed here because it is worth something: it is a
+// connection to the service, which is what a banner is read from. The caller closes it.
+func connectOpen(
+	ctx context.Context,
+	address net.IP,
+	port int,
+	timeout time.Duration,
+) (net.Conn, error) {
 	dialContext, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
@@ -89,12 +172,13 @@ func connectOpen(ctx context.Context, address net.IP, port int, timeout time.Dur
 		net.JoinHostPort(address.String(), strconv.Itoa(port)),
 	)
 	if err != nil {
-		return false
+		return nil, altshiftErrors.NewWithTrace(
+			fmt.Errorf("dialer dial context: %w", err),
+			address.String(), port,
+		)
 	}
 
-	_ = connection.Close()
-
-	return true
+	return connection, nil
 }
 
 func ipVersionOf(address net.IP) int {
@@ -116,11 +200,21 @@ func expandNetworks(networks []*net.IPNet, skipIpv6 bool) ([]net.IP, error) {
 			continue
 		}
 
-		if skipIpv6 && network.IP.To4() == nil {
+		// An address and its mask have to be the same width before anything can be done with them.
+		// net.ParseCIDR returns a four-byte IP for an IPv4 network, but net.ParseIP returns a
+		// sixteen-byte one, and pairing that with net.CIDRMask(32, 32) is what anyone assembling an
+		// IPNet by hand produces. Masking a sixteen-byte address with a four-byte mask yields four
+		// bytes, which then matches nothing -- so the scan silently enumerated no addresses at all.
+		address, mask := normaliseNetwork(network)
+		if address == nil || len(address) != len(mask) {
 			continue
 		}
 
-		ones, bits := network.Mask.Size()
+		if skipIpv6 && address.To4() == nil {
+			continue
+		}
+
+		ones, bits := mask.Size()
 		if bits == 0 {
 			continue
 		}
@@ -129,11 +223,13 @@ func expandNetworks(networks []*net.IPNet, skipIpv6 bool) ([]net.IP, error) {
 		// address in it is a host.
 		skipEdges := bits == 32 && ones < 31
 
-		current := make(net.IP, len(network.IP))
-		copy(current, network.IP.Mask(network.Mask))
+		current := make(net.IP, len(address))
+		copy(current, address.Mask(mask))
 
-		for network.Contains(current) {
-			if !skipEdges || !isNetworkOrBroadcast(current, network) {
+		normalised := &net.IPNet{IP: address, Mask: mask}
+
+		for normalised.Contains(current) {
+			if !skipEdges || !isNetworkOrBroadcast(current, normalised) {
 				if len(addresses) >= maxConnectAddresses {
 					return nil, altshiftErrors.NewWithTrace(
 						fmt.Errorf("%w: %w", altshiftErrors.ErrValidationError, portScannerErrors.ErrTooManyAddresses),
@@ -153,6 +249,46 @@ func expandNetworks(networks []*net.IPNet, skipIpv6 bool) ([]net.IP, error) {
 	}
 
 	return addresses, nil
+}
+
+// normaliseNetwork returns the network's address and mask at a single width.
+//
+// An IPv4 address is reduced to its four-byte form, and a sixteen-byte mask over one to its last
+// four bytes -- but only when the leading twelve bytes are the all-ones of the IPv4-mapped prefix.
+// A mask that covers less than that is not describing an IPv4 network at all, so it and its address
+// are left at sixteen bytes and treated as the IPv6 network they are.
+func normaliseNetwork(network *net.IPNet) (net.IP, net.IPMask) {
+	address := network.IP
+	mask := network.Mask
+
+	if address4 := address.To4(); address4 != nil {
+		switch len(mask) {
+		case net.IPv4len:
+			return address4, mask
+		case net.IPv6len:
+			if isIpv4MappedMask(mask) {
+				return address4, mask[12:]
+			}
+		}
+	}
+
+	if address16 := address.To16(); address16 != nil && len(mask) == net.IPv6len {
+		return address16, mask
+	}
+
+	return address, mask
+}
+
+// isIpv4MappedMask reports whether a sixteen-byte mask keeps the whole of the IPv4-mapped prefix,
+// which is what makes its last four bytes an IPv4 mask.
+func isIpv4MappedMask(mask net.IPMask) bool {
+	for _, octet := range mask[:12] {
+		if octet != 0xff {
+			return false
+		}
+	}
+
+	return true
 }
 
 func isNetworkOrBroadcast(address net.IP, network *net.IPNet) bool {

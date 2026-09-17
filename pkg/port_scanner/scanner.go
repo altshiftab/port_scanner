@@ -21,6 +21,8 @@ import (
 	"github.com/gopacket/gopacket"
 	"github.com/gopacket/gopacket/layers"
 
+	"github.com/altshiftab/port_scanner/pkg/banner"
+
 	portScannerErrors "github.com/altshiftab/port_scanner/pkg/errors"
 	"github.com/altshiftab/port_scanner/pkg/port_scanner/port_scanner_config"
 	"github.com/altshiftab/port_scanner/pkg/types/listener_handler"
@@ -29,9 +31,14 @@ import (
 
 // PacketSource is where a reader gets captured packets from; *CaptureHandle is one.
 //
-// A read blocks until a frame arrives or the source is closed. Closing it is
-// therefore how a reader is told the scan is over: the blocked read returns an
-// error, which the reader treats as the end rather than a failure.
+// A read blocks until a frame arrives or the source is closed, and has no timeout of its own.
+// Closing it is therefore the only way to wake a reader waiting on a quiet interface: the blocked
+// read returns an error, which the reader treats as the end of the scan rather than a failure.
+//
+// Because the source belongs to the caller, Scan cannot close it, and so does not wait indefinitely
+// for a reader parked in one -- it gives readers a moment and leaves the rest to be freed by the
+// caller's close. A reader that outlives its scan reports nothing: it delivers no callback once the
+// scan's context is done.
 type PacketSource interface {
 	ReadPacketData() ([]byte, gopacket.CaptureInfo, error)
 	LinkType() layers.LinkType
@@ -54,6 +61,13 @@ type probe struct {
 	// produce a second result.
 	answered atomic.Bool
 }
+
+// readerShutdownGrace is how long a scan waits for its readers once it has cancelled them.
+//
+// A reader that can come back does so as soon as its pending read yields, which is immediate; one
+// parked in a read that only a close will wake never will, and waiting for it would deadlock. The
+// grace is therefore short: it is the allowance for the first kind, not a wait for the second.
+const readerShutdownGrace = 100 * time.Millisecond
 
 // Scanner sends TCP SYN probes and matches the SYN/ACKs that come back to them. Each outstanding
 // probe holds one of Concurrency slots; the slot number is encoded in the probe's sequence number,
@@ -178,8 +192,13 @@ func validateConfig(config *port_scanner_config.Config) error {
 }
 
 // Scan probes every port of every address in the networks, in a pseudo-random order, and returns
-// once every probe has been answered or has timed out and every reader has stopped. It returns
-// the context's error if the context ends first; results reported until then stand.
+// once every probe has been answered or has timed out. It returns the context's error if the
+// context ends first; results reported until then stand.
+//
+// Every callback has returned by the time Scan does. A reader may not have: one parked in a packet
+// source read can only be woken by the caller closing that source, which the caller cannot do until
+// this returns, so waiting for it would deadlock. Such a reader delivers nothing further and ends
+// as soon as the source is closed.
 //
 // A probe that cannot be prepared or sent is logged and skipped; the scan fails only if no probe
 // at all could be sent. A packet source that fails is logged and dropped; the scan fails only if
@@ -263,10 +282,23 @@ func (scanner *Scanner) Scan(ctx context.Context, networks []*net.IPNet, ports [
 	}
 
 	cancel()
-	readers.Wait()
-	close(readerErrors)
-	// Readers are the only ones that start callbacks, and they have all stopped, so this waits
-	// for the last of them.
+
+	// A reader parked in a packet source read cannot be woken by the cancellation above. A capture
+	// handle has no read deadline: the read returns when a frame arrives or when the handle is
+	// closed, and on a quiet interface -- which is most of them, behind a filter this narrow --
+	// neither happens. Closing it is the caller's to do, since a Scanner does not own its sources,
+	// and the caller cannot do it until this returns. Waiting for such a reader here is therefore
+	// waiting for something only this return can bring about.
+	//
+	// So readers are given a moment and then left. A reader that can return does so as soon as its
+	// read yields, which is immediate; one that cannot is freed by the caller's close a moment
+	// later. Nothing is lost by not waiting for it: it dispatches no callback once the context is
+	// done, and readerErrors holds one slot per source, so a late failure can neither block nor be
+	// reported into a closed channel.
+	waitFor(&readers, readerShutdownGrace)
+
+	// Readers dispatch no callbacks once the context is done, so every callback that will ever be
+	// started has been; this waits for the last of them.
 	scanner.callbacks.Wait()
 
 	var errs []error
@@ -275,9 +307,12 @@ func (scanner *Scanner) Scan(ctx context.Context, networks []*net.IPNet, ports [
 	}
 	// Reader errors have been logged as they happened; they fail the scan only if every reader
 	// failed, since the ones that failed early were still counted on for replies.
+	//
+	// Drained rather than ranged over: the channel is never closed, because a reader that outlived
+	// the wait above may still report a failure into it.
 	if len(scanner.packetSources) != 0 && liveReaders.Load() == 0 {
-		for readerErr := range readerErrors {
-			errs = append(errs, fmt.Errorf("read replies: %w", readerErr))
+		for len(readerErrors) > 0 {
+			errs = append(errs, fmt.Errorf("read replies: %w", <-readerErrors))
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -479,11 +514,40 @@ func (scanner *Scanner) readReplies(ctx context.Context, packetSource PacketSour
 		}
 
 		if reply, ok := decoder.decode(data); ok {
+			// Checked again here rather than only at the top of the loop: the scan may have ended
+			// while this frame was being waited for, and a reader that has outlived its scan must
+			// not deliver a result to a caller that has already been told the scan is over.
+			if ctx.Err() != nil {
+				return nil
+			}
+
 			scanner.consumeReply(ctx, reply)
 		}
 	}
 
 	return nil
+}
+
+// waitFor waits for the group to finish, giving up after the grace period.
+//
+// It exists for one situation: a goroutine blocked on something only the caller of this package can
+// unblock. Waiting without a bound would deadlock, and not waiting at all would give up on the
+// goroutines that were about to finish anyway.
+func waitFor(group *sync.WaitGroup, grace time.Duration) {
+	finished := make(chan struct{})
+
+	go func() {
+		group.Wait()
+		close(finished)
+	}()
+
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
+
+	select {
+	case <-finished:
+	case <-timer.C:
+	}
 }
 
 // consumeReply matches a SYN/ACK to the probe in the slot its acknowledgement number names and, if
@@ -533,7 +597,21 @@ func (scanner *Scanner) consumeReply(ctx context.Context, reply *reply) {
 	}
 	// The callback is the caller's and may be slow; it must not hold up the reader, which has the
 	// capture buffer behind it.
-	scanner.callbacks.Go(func() { scanner.callback(result) })
+	scanner.callbacks.Go(func() {
+		// A SYN scan never completed a handshake, so there is no connection to read a banner from
+		// and one has to be opened. It happens here rather than in the reader for the same reason
+		// the callback does: it is seconds of waiting, and the capture buffer is filling behind it.
+		if scanner.config.Banner {
+			result.Banner = banner.GrabAddress(
+				ctx,
+				result.IpAddress,
+				result.Port,
+				scanner.config.BannerOptions...,
+			)
+		}
+
+		scanner.callback(result)
+	})
 }
 
 // debug logs at debug level with an error built only if that level is enabled: unmatched packets

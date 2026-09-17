@@ -31,6 +31,9 @@ import (
 
 const (
 	defaultTimeout = "1s"
+	// defaultConnectTimeout is how long one handshake of a connect scan may take. It is longer than
+	// the SYN timeout because it is a whole handshake rather than one packet's round trip.
+	defaultConnectTimeout = "2s"
 	// maxPort is the largest TCP port number.
 	maxPort = 65535
 )
@@ -125,6 +128,17 @@ func (printer *resultPrinter) print(result *port_scanner.Result) error {
 		line = string(encoded)
 	} else {
 		line = net.JoinHostPort(result.IpAddress, strconv.Itoa(result.Port))
+
+		// A banner is appended rather than given a line of its own, so that the plain output stays
+		// one result per line and remains something a shell loop can read.
+		if grabbed := result.Banner; grabbed != nil {
+			if grabbed.Service != "" {
+				line += "\t" + grabbed.Service
+			}
+			if grabbed.Text != "" {
+				line += "\t" + grabbed.Text
+			}
+		}
 	}
 
 	printer.mu.Lock()
@@ -150,6 +164,9 @@ func main() {
 	var interfaceNames []string
 	var jsonOutput bool
 	var verbose bool
+	var connectMode bool
+	var connectTimeoutString string
+	var grabBanner bool
 
 	parser := &argument_parser.Parser{
 		Description: "Find open TCP ports with SYN probes. A SYN is sent to every port of every target and " +
@@ -194,6 +211,28 @@ func main() {
 				"DURATION",
 			),
 			option.NewBoolOption('6', "ipv6", "Enable IPv6: open an IPv6 raw socket and accept IPv6 targets.", false, &includeIpv6),
+			option.NewBoolOption(
+				'c', "connect",
+				"Find open ports by completing a TCP handshake instead of sending bare SYNs. Needs no "+
+					"privileges, but is slower and the target logs the connection.",
+				false, &connectMode,
+			),
+			option.WithMetavar(
+				option.WithDefault(
+					option.NewStringOption(
+						0, "connect-timeout",
+						"How long one handshake of a connect scan may take, e.g. 2s. Connect scans only.",
+						false, &connectTimeoutString,
+					),
+					defaultConnectTimeout,
+				),
+				"DURATION",
+			),
+			option.NewBoolOption(
+				'b', "banner",
+				"Ask each open port what is behind it and report the service and what it said.",
+				false, &grabBanner,
+			),
 			// One name per occurrence, so that a target may follow: a greedy option would swallow it.
 			option.WithNargs(
 				option.WithMetavar(
@@ -248,6 +287,27 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	connectTimeout, err := time.ParseDuration(connectTimeoutString)
+	if err != nil {
+		logger.FatalWithExitingMessage(
+			"The connect timeout could not be parsed.",
+			altshiftErrors.New(fmt.Errorf("time parse duration: %w", err), connectTimeoutString),
+		)
+	}
+
+	scanOptions := []port_scanner_config.Option{
+		port_scanner_config.WithConcurrency(concurrency),
+		port_scanner_config.WithTimeout(timeout),
+		port_scanner_config.WithSkipIpv6(!includeIpv6),
+		port_scanner_config.WithInterfaceNames(interfaceNames...),
+		port_scanner_config.WithConnectTimeout(connectTimeout),
+		port_scanner_config.WithBanner(grabBanner),
+	}
+
+	if connectMode {
+		scanOptions = append(scanOptions, port_scanner_config.WithMode(port_scanner_config.ModeConnect))
+	}
+
 	printer := &resultPrinter{writer: os.Stdout, json: jsonOutput}
 
 	err = port_scanner.Scan(
@@ -262,10 +322,7 @@ func main() {
 				)
 			}
 		},
-		port_scanner_config.WithConcurrency(concurrency),
-		port_scanner_config.WithTimeout(timeout),
-		port_scanner_config.WithSkipIpv6(!includeIpv6),
-		port_scanner_config.WithInterfaceNames(interfaceNames...),
+		scanOptions...,
 	)
 	if err != nil {
 		switch {
@@ -274,8 +331,8 @@ func main() {
 			os.Exit(130)
 		case errors.Is(err, portScannerErrors.ErrNotPrivileged):
 			// A user's mistake, not the program's: one line, no stack trace.
-			fmt.Fprintln(os.Stderr, "port_scanner: error: sending probes needs CAP_NET_RAW; run as root or grant the "+
-				"capability to the binary (setcap cap_net_raw+ep)")
+			fmt.Fprintln(os.Stderr, "port_scanner: error: sending SYN probes needs CAP_NET_RAW; run as root, grant the "+
+				"capability to the binary (setcap cap_net_raw+ep), or scan with --connect, which needs no privileges")
 			os.Exit(1)
 		case errors.Is(err, altshiftErrors.ErrValidationError), errors.Is(err, altshiftErrors.ErrParseError):
 			fmt.Fprintf(os.Stderr, "port_scanner: error: %s\n", err)

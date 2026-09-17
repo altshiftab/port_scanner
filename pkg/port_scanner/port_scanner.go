@@ -1,6 +1,15 @@
-// Package port_scanner finds open TCP ports with SYN probes: a SYN is sent from a raw socket, the
-// SYN/ACK that an open port answers with is captured with libpcap, and the kernel, which knows
-// nothing of the connection, resets it. Sending needs CAP_NET_RAW.
+// Package port_scanner finds open TCP ports, in either of two modes.
+//
+// ModeSyn sends a bare SYN from a raw socket, captures the SYN/ACK an open port answers with from
+// an AF_PACKET socket, and lets the kernel -- which knows nothing of the connection -- reset it. It
+// is fast and leaves the target with nothing to log, and it needs CAP_NET_RAW.
+//
+// ModeConnect completes an ordinary TCP handshake instead. It needs no privileges at all, which is
+// what makes it the mode to use where CAP_NET_RAW cannot be had -- a container, or a sandbox such
+// as Google Cloud Run -- at the cost of being slower and of the target seeing the connection.
+//
+// Either mode can be asked to report what is behind each open port it finds; see
+// port_scanner_config.WithBanner and the banner package.
 package port_scanner
 
 import (
@@ -18,6 +27,7 @@ import (
 	altshiftNet "github.com/altshiftab/utils_go/pkg/net"
 	"golang.org/x/sys/unix"
 
+	"github.com/altshiftab/port_scanner/pkg/banner"
 	portScannerErrors "github.com/altshiftab/port_scanner/pkg/errors"
 	"github.com/altshiftab/port_scanner/pkg/port_scanner/port_scanner_config"
 	"github.com/altshiftab/port_scanner/pkg/types/listener_handler"
@@ -32,6 +42,11 @@ type Result struct {
 	Port      int    `json:"port"`
 	Transport string `json:"transport"`
 	IpVersion int    `json:"ip_version"`
+
+	// Banner is what the service behind the port said about itself, where the scan was told to ask
+	// and the port answered. A port that was not asked and a port that was asked and said nothing
+	// are both nil here; Config.Banner is what tells them apart.
+	Banner *banner.Banner `json:"banner,omitzero"`
 }
 
 // IsPrivileged reports whether the process may open raw sockets and capture packets: it is root,
@@ -94,9 +109,11 @@ func ParseTargets(targets []string) ([]*net.IPNet, error) {
 }
 
 // Scan probes the ports of every target, each an IP address or a CIDR block, and reports each open
-// port to callback. It sets up and tears down what the scan needs: the source port and raw sockets,
-// and a capture handle on every interface that is up (or the ones named in the options). The
-// callback is invoked concurrently and must be safe for that.
+// port to callback. The callback is invoked concurrently and must be safe for that.
+//
+// It sets up and tears down whatever the chosen mode needs. In ModeSyn that is the source port, the
+// raw sockets and a capture handle on every interface that is up (or the ones named in the
+// options); in ModeConnect it is nothing at all, since the mode only dials.
 func Scan(
 	ctx context.Context,
 	targets []string,

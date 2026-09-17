@@ -226,6 +226,9 @@ func OpenPcapHandles(
 // ClosePcapHandles closes every handle. A reader blocked on a handle is woken by
 // the close and returns an error, which is how it learns the scan is over - an
 // AF_PACKET read has no timeout of its own to return on.
+//
+// It is therefore what frees a reader still parked when Scan returned, and should be called as soon
+// as the scan is done with the handles.
 func ClosePcapHandles(handles []*CaptureHandle) {
 	for _, handle := range handles {
 		if handle != nil {

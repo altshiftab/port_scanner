@@ -8,9 +8,9 @@ import (
 	"github.com/gopacket/gopacket/layers"
 )
 
-// linkTypeDltRaw is DLT_RAW as libpcap reports it for interfaces that carry bare IP packets, such
-// as tunnels. gopacket's LinkTypeRaw is the pcap-file value for the same thing (101), and
-// pcap.Handle.LinkType() returns the DLT value, so both are recognised.
+// linkTypeDltRaw is DLT_RAW, the link type of an interface that carries bare IP packets rather than
+// frames -- a tunnel, most often. gopacket's LinkTypeRaw is the pcap-file value for the same thing
+// (101) and this is the DLT value, so both are recognised.
 const linkTypeDltRaw layers.LinkType = 12
 
 const (

@@ -3,6 +3,8 @@ package port_scanner_config
 
 import (
 	"time"
+
+	"github.com/altshiftab/port_scanner/pkg/banner/banner_config"
 )
 
 const (
@@ -58,6 +60,17 @@ type Config struct {
 	Mode Mode
 	// ConnectTimeout bounds one handshake of a connect scan.
 	ConnectTimeout time.Duration
+
+	// Banner says whether an open port is asked what is behind it. Only open ports are asked, and
+	// they are rare, so what this costs a scan is a function of what it finds rather than of what
+	// it probes.
+	//
+	// A connect scan grabs the banner on the connection it already has. A SYN scan has no
+	// connection -- that is the point of it -- so it opens one, which the target sees and logs.
+	Banner bool
+
+	// BannerOptions are handed to each banner grab.
+	BannerOptions []banner_config.Option
 }
 
 type Option func(*Config)
@@ -126,6 +139,21 @@ func WithInterfaceNames(interfaceNames ...string) Option {
 func WithMode(mode Mode) Option {
 	return func(config *Config) {
 		config.Mode = mode
+	}
+}
+
+// WithBanner sets whether an open port is asked what is behind it.
+func WithBanner(grabBanner bool) Option {
+	return func(config *Config) {
+		config.Banner = grabBanner
+	}
+}
+
+// WithBannerOptions sets the options handed to each banner grab. It does not turn grabbing on;
+// pass WithBanner as well.
+func WithBannerOptions(options ...banner_config.Option) Option {
+	return func(config *Config) {
+		config.BannerOptions = append(config.BannerOptions, options...)
 	}
 }
 
