@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -18,8 +19,7 @@ import (
 	altshiftContext "github.com/altshiftab/utils_go/pkg/context"
 	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
 	"github.com/altshiftab/utils_go/pkg/errors/types/nil_error"
-	"github.com/gopacket/gopacket"
-	"github.com/gopacket/gopacket/layers"
+	"github.com/altshiftab/utils_go/pkg/net/packet"
 
 	"github.com/altshiftab/port_scanner/pkg/banner"
 
@@ -31,7 +31,8 @@ import (
 
 // PacketSource is where a reader gets captured packets from; *CaptureHandle is one.
 //
-// A read blocks until a frame arrives or the source is closed, and has no timeout of its own.
+// A read returns a packet from its IP header on. It blocks until a packet arrives or the source is
+// closed, and has no timeout of its own.
 // Closing it is therefore the only way to wake a reader waiting on a quiet interface: the blocked
 // read returns an error, which the reader treats as the end of the scan rather than a failure.
 //
@@ -40,8 +41,7 @@ import (
 // caller's close. A reader that outlives its scan reports nothing: it delivers no callback once the
 // scan's context is done.
 type PacketSource interface {
-	ReadPacketData() ([]byte, gopacket.CaptureInfo, error)
-	LinkType() layers.LinkType
+	ReadPacketData() ([]byte, error)
 
 	// Closed reports whether the source has been closed, which is how a reader
 	// tells an ended scan from a failed capture.
@@ -52,7 +52,7 @@ var _ PacketSource = (*CaptureHandle)(nil)
 
 // probe is an outstanding SYN: the target it went to and how to give its slot back.
 type probe struct {
-	ip   net.IP
+	ip   netip.Addr
 	port int
 	// release returns the probe's slot to the pool. It is idempotent: the reply and the timeout
 	// both call it, and whichever comes second must be harmless.
@@ -361,7 +361,7 @@ func (scanner *Scanner) sendProbes(
 	size := space.Size()
 	shuffle := permutation.New(size, shuffleSeed)
 	sourceIps := newCachedSourceIpResolver(scanner.resolveSourceIp)
-	buffer := gopacket.NewSerializeBuffer()
+	var buffer []byte
 	timeout := scanner.config.Timeout
 	listenPort := scanner.listenHandler.ListenPort
 
@@ -397,9 +397,14 @@ func (scanner *Scanner) sendProbes(
 			continue
 		}
 
-		networkLayer, err := NewProbeNetworkLayer(sourceIp, destinationIp)
+		source, err := probeAddress(sourceIp)
 		if err != nil {
-			return altshiftErrors.New(fmt.Errorf("new probe network layer: %w", err), sourceIp, destinationIp)
+			return fmt.Errorf("probe address (source): %w", err)
+		}
+
+		destination, err := probeAddress(destinationIp)
+		if err != nil {
+			return fmt.Errorf("probe address (destination): %w", err)
 		}
 
 		connection, err := scanner.listenHandler.Connection(destinationIp)
@@ -414,7 +419,7 @@ func (scanner *Scanner) sendProbes(
 		case slot = <-freeSlots:
 		}
 
-		outstanding := &probe{ip: destinationIp, port: destinationPort}
+		outstanding := &probe{ip: destination, port: destinationPort}
 		outstanding.release = sync.OnceFunc(func() {
 			// The slot is cleared before it is handed back, so that a probe never sees an
 			// earlier probe in the slot it was just given.
@@ -423,13 +428,14 @@ func (scanner *Scanner) sendProbes(
 		})
 		scanner.slots[slot].Store(outstanding)
 
-		tcpLayer, err := NewProbeTcpLayer(listenPort, destinationPort, scanner.sequenceBase+slot)
+		tcp, err := NewProbe(listenPort, destinationPort, scanner.sequenceBase+slot)
 		if err != nil {
 			outstanding.release()
-			return altshiftErrors.New(fmt.Errorf("new probe tcp layer: %w", err), destinationPort)
+			return altshiftErrors.New(fmt.Errorf("new probe: %w", err), destinationPort)
 		}
 
-		if err := scanner.sendWithRetries(ctx, tcpLayer, networkLayer, connection, buffer); err != nil {
+		buffer, err = scanner.sendWithRetries(ctx, tcp, source, destination, connection, buffer)
+		if err != nil {
 			lastErr = altshiftErrors.New(
 				fmt.Errorf("send with retries: %w", err),
 				destinationIp, destinationPort,
@@ -461,28 +467,31 @@ func isTransientSendError(err error) bool {
 }
 
 // sendWithRetries sends a probe, trying again after a pause when sending fails for a transient
-// reason. It returns the last error when the probe could not be sent.
+// reason. It returns the last error when the probe could not be sent, and the buffer for the next
+// probe to reuse either way.
 func (scanner *Scanner) sendWithRetries(
 	ctx context.Context,
-	tcpLayer *layers.TCP,
-	networkLayer gopacket.NetworkLayer,
+	tcp *packet.Tcp,
+	source netip.Addr,
+	destination netip.Addr,
 	connection net.PacketConn,
-	buffer gopacket.SerializeBuffer,
-) error {
+	buffer []byte,
+) ([]byte, error) {
 	attempts := scanner.config.SendAttempts
 	for attempt := 1; ; attempt++ {
-		err := SendTcpPacket(tcpLayer, networkLayer, connection, buffer)
+		var err error
+		buffer, err = SendTcpPacket(tcp, source, destination, connection, buffer)
 		if err == nil {
-			return nil
+			return buffer, nil
 		}
 
 		if attempt >= attempts || !isTransientSendError(err) {
-			return altshiftErrors.New(fmt.Errorf("send tcp packet: %w", err), attempt)
+			return buffer, altshiftErrors.New(fmt.Errorf("send tcp packet: %w", err), attempt)
 		}
 
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("context err: %w", ctx.Err())
+			return buffer, fmt.Errorf("context err: %w", ctx.Err())
 		case <-time.After(scanner.config.SendRetryWait):
 		}
 	}
@@ -495,10 +504,8 @@ func (scanner *Scanner) readReplies(ctx context.Context, packetSource PacketSour
 		return altshiftErrors.NewWithTrace(nil_error.New("packet source"))
 	}
 
-	decoder := newReplyDecoder(packetSource.LinkType())
-
 	for ctx.Err() == nil {
-		data, _, err := packetSource.ReadPacketData()
+		data, err := packetSource.ReadPacketData()
 		if err != nil {
 			if errors.Is(err, io.EOF) {
 				return nil
@@ -513,7 +520,7 @@ func (scanner *Scanner) readReplies(ctx context.Context, packetSource PacketSour
 			return altshiftErrors.NewWithTrace(fmt.Errorf("read packet data: %w", err))
 		}
 
-		if reply, ok := decoder.decode(data); ok {
+		if reply, ok := decodeReply(data); ok {
 			// Checked again here rather than only at the top of the loop: the scan may have ended
 			// while this frame was being waited for, and a reader that has outlived its scan must
 			// not deliver a result to a caller that has already been told the scan is over.
@@ -571,7 +578,7 @@ func (scanner *Scanner) consumeReply(ctx context.Context, reply *reply) {
 		return
 	}
 
-	if reply.sourcePort != outstanding.port || !reply.sourceIp.Equal(outstanding.ip) {
+	if reply.sourcePort != outstanding.port || reply.sourceIp != outstanding.ip {
 		// A late reply to an earlier probe whose slot has since been reused, or an unrelated
 		// segment; either way, not what the slot is waiting for.
 		scanner.debug(ctx, "A reply does not match the probe in its slot. Skipping.", func() error {

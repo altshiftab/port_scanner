@@ -8,24 +8,26 @@ import (
 	"golang.org/x/net/bpf"
 )
 
-// Offsets into an Ethernet frame that the reply filter reads.
+// Offsets into a captured packet that the reply filter reads. The capture socket hands over each
+// packet from its IP header on, whatever the link it arrived over, so the offsets are counted from
+// there.
 const (
-	etherTypeOffset = 12
-	etherHeaderSize = 14
+	// The IP version is the high nibble of the first byte, in both versions.
+	ipVersionOffset = 0
+	ipVersionMask   = 0xf0
 
-	// IPv4, measured from the start of the frame.
-	ipv4ProtocolOffset       = etherHeaderSize + 9
-	ipv4FragmentOffsetOffset = etherHeaderSize + 6
-	ipv4HeaderLengthOffset   = etherHeaderSize
+	ipv4ProtocolOffset       = 9
+	ipv4FragmentOffsetOffset = 6
+	ipv4HeaderLengthOffset   = 0
 
 	// IPv6 has a fixed 40-byte header, so the payload sits at a known offset.
-	ipv6NextHeaderOffset = etherHeaderSize + 6
+	ipv6NextHeaderOffset = 6
 	ipv6HeaderSize       = 40
 )
 
 const (
-	etherTypeIpv4 = 0x0800
-	etherTypeIpv6 = 0x86dd
+	ipv4VersionNibble = 0x40
+	ipv6VersionNibble = 0x60
 
 	protocolTcp = 6
 
@@ -54,10 +56,13 @@ func ReplyFilterInstructions(listenPort uint16) []bpf.Instruction {
 	port := uint32(listenPort)
 
 	return []bpf.Instruction{
-		// Dispatch on EtherType.
-		bpf.LoadAbsolute{Off: etherTypeOffset, Size: 2},
-		bpf.JumpIf{Cond: bpf.JumpEqual, Val: etherTypeIpv4, SkipTrue: 1},
-		bpf.JumpIf{Cond: bpf.JumpEqual, Val: etherTypeIpv6, SkipTrue: 7, SkipFalse: 12},
+		// Dispatch on the IP version. The socket also sees what is not IP, ARP above all; such a
+		// packet that happens to start with one of these nibbles still has to pass the checks
+		// below, and the reader drops it by its link-layer protocol regardless.
+		bpf.LoadAbsolute{Off: ipVersionOffset, Size: 1},
+		bpf.ALUOpConstant{Op: bpf.ALUOpAnd, Val: ipVersionMask},
+		bpf.JumpIf{Cond: bpf.JumpEqual, Val: ipv4VersionNibble, SkipTrue: 1},
+		bpf.JumpIf{Cond: bpf.JumpEqual, Val: ipv6VersionNibble, SkipTrue: 7, SkipFalse: 12},
 
 		// IPv4: the header is variable length, so the port offset is computed.
 		bpf.LoadAbsolute{Off: ipv4ProtocolOffset, Size: 1},
@@ -66,7 +71,7 @@ func ReplyFilterInstructions(listenPort uint16) []bpf.Instruction {
 		bpf.LoadAbsolute{Off: ipv4FragmentOffsetOffset, Size: 2},
 		bpf.JumpIf{Cond: bpf.JumpBitsSet, Val: fragmentOffsetMask, SkipTrue: 8},
 		bpf.LoadMemShift{Off: ipv4HeaderLengthOffset},
-		bpf.LoadIndirect{Off: etherHeaderSize + tcpDestinationPortOffset, Size: 2},
+		bpf.LoadIndirect{Off: tcpDestinationPortOffset, Size: 2},
 		bpf.JumpIf{Cond: bpf.JumpEqual, Val: port, SkipTrue: 4, SkipFalse: 5},
 
 		// IPv6: a fixed-length header, so the port offset is a constant. Only a
@@ -74,10 +79,7 @@ func ReplyFilterInstructions(listenPort uint16) []bpf.Instruction {
 		// is not a reply this scanner sends probes to provoke.
 		bpf.LoadAbsolute{Off: ipv6NextHeaderOffset, Size: 1},
 		bpf.JumpIf{Cond: bpf.JumpNotEqual, Val: protocolTcp, SkipTrue: 3},
-		bpf.LoadAbsolute{
-			Off:  etherHeaderSize + ipv6HeaderSize + tcpDestinationPortOffset,
-			Size: 2,
-		},
+		bpf.LoadAbsolute{Off: ipv6HeaderSize + tcpDestinationPortOffset, Size: 2},
 		bpf.JumpIf{Cond: bpf.JumpNotEqual, Val: port, SkipTrue: 1},
 
 		bpf.RetConstant{Val: snapshotLength},

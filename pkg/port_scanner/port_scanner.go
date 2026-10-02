@@ -196,15 +196,15 @@ func ScanNetworks(
 		}
 	}()
 
-	pcapHandles, err := OpenPcapHandles(ctx, listenHandler.ListenPort, config.InterfaceNames)
+	captureHandles, err := OpenCaptureHandles(ctx, listenHandler.ListenPort, config.InterfaceNames)
 	if err != nil {
-		return altshiftErrors.New(fmt.Errorf("open pcap handles: %w", err), listenHandler.ListenPort)
+		return altshiftErrors.New(fmt.Errorf("open capture handles: %w", err), listenHandler.ListenPort)
 	}
-	defer ClosePcapHandles(pcapHandles)
+	defer CloseCaptureHandles(captureHandles)
 
-	packetSources := make([]PacketSource, 0, len(pcapHandles))
-	for _, pcapHandle := range pcapHandles {
-		packetSources = append(packetSources, pcapHandle)
+	packetSources := make([]PacketSource, 0, len(captureHandles))
+	for _, captureHandle := range captureHandles {
+		packetSources = append(packetSources, captureHandle)
 	}
 
 	scanner, err := NewScanner(listenHandler, packetSources, callback, options...)

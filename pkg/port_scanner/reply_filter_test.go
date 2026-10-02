@@ -10,13 +10,6 @@ import (
 
 const replyFilterTestPort = 44444
 
-// frame builds an Ethernet frame carrying the given payload.
-func frame(etherType uint16, payload []byte) []byte {
-	out := make([]byte, etherHeaderSize)
-	binary.BigEndian.PutUint16(out[etherTypeOffset:], etherType)
-	return slices.Concat(out, payload)
-}
-
 // ipv4Packet builds an IPv4 packet with the given protocol, fragment offset and
 // payload, using a header of headerWords 32-bit words.
 func ipv4Packet(protocol byte, fragmentOffset uint16, headerWords byte, payload []byte) []byte {
@@ -45,7 +38,7 @@ func tcpSegment(destinationPort uint16) []byte {
 
 // The filter decides what the scanner ever sees. A mistake here does not fail
 // loudly - it silently drops replies and the scan reports nothing open - so the
-// program is run against crafted frames rather than trusted by inspection.
+// program is run against crafted packets rather than trusted by inspection.
 func TestReplyFilterAcceptsAndRejects(t *testing.T) {
 	t.Parallel()
 
@@ -61,56 +54,71 @@ func TestReplyFilterAcceptsAndRejects(t *testing.T) {
 
 	testCases := []struct {
 		name       string
-		frame      []byte
+		data       []byte
 		wantAccept bool
 	}{
 		{
 			name:       "ipv4 tcp addressed to the listen port",
-			frame:      frame(etherTypeIpv4, ipv4Packet(protocolTcp, 0, 5, tcpSegment(replyFilterTestPort))),
+			data:       ipv4Packet(protocolTcp, 0, 5, tcpSegment(replyFilterTestPort)),
 			wantAccept: true,
 		},
 		{
 			name:       "ipv4 tcp addressed elsewhere",
-			frame:      frame(etherTypeIpv4, ipv4Packet(protocolTcp, 0, 5, tcpSegment(80))),
+			data:       ipv4Packet(protocolTcp, 0, 5, tcpSegment(80)),
 			wantAccept: false,
 		},
 		{
 			name:       "ipv4 udp to the listen port",
-			frame:      frame(etherTypeIpv4, ipv4Packet(17, 0, 5, tcpSegment(replyFilterTestPort))),
+			data:       ipv4Packet(17, 0, 5, tcpSegment(replyFilterTestPort)),
 			wantAccept: false,
 		},
 		{
 			// A header with options is longer, so the port offset must be
 			// computed from the IHL rather than assumed.
 			name:       "ipv4 tcp with header options",
-			frame:      frame(etherTypeIpv4, ipv4Packet(protocolTcp, 0, 8, tcpSegment(replyFilterTestPort))),
+			data:       ipv4Packet(protocolTcp, 0, 8, tcpSegment(replyFilterTestPort)),
 			wantAccept: true,
 		},
 		{
 			// A later fragment has no TCP header, so whatever sits at the port
 			// offset is not a port.
 			name:       "ipv4 non-first fragment",
-			frame:      frame(etherTypeIpv4, ipv4Packet(protocolTcp, 100, 5, tcpSegment(replyFilterTestPort))),
+			data:       ipv4Packet(protocolTcp, 100, 5, tcpSegment(replyFilterTestPort)),
 			wantAccept: false,
 		},
 		{
 			name:       "ipv6 tcp addressed to the listen port",
-			frame:      frame(etherTypeIpv6, ipv6Packet(protocolTcp, tcpSegment(replyFilterTestPort))),
+			data:       ipv6Packet(protocolTcp, tcpSegment(replyFilterTestPort)),
 			wantAccept: true,
 		},
 		{
 			name:       "ipv6 tcp addressed elsewhere",
-			frame:      frame(etherTypeIpv6, ipv6Packet(protocolTcp, tcpSegment(443))),
+			data:       ipv6Packet(protocolTcp, tcpSegment(443)),
 			wantAccept: false,
 		},
 		{
 			name:       "ipv6 udp to the listen port",
-			frame:      frame(etherTypeIpv6, ipv6Packet(17, tcpSegment(replyFilterTestPort))),
+			data:       ipv6Packet(17, tcpSegment(replyFilterTestPort)),
 			wantAccept: false,
 		},
 		{
+			// A bare TCP next header is all the filter accepts; a reply this scanner provokes
+			// carries no extension headers.
+			name:       "ipv6 tcp behind an extension header",
+			data:       ipv6Packet(60, slices.Concat([]byte{protocolTcp, 0, 1, 4, 0, 0, 0, 0}, tcpSegment(replyFilterTestPort))),
+			wantAccept: false,
+		},
+		{
+			// An ARP packet, starting with its hardware type.
 			name:       "arp is not ip at all",
-			frame:      frame(0x0806, make([]byte, 28)),
+			data:       slices.Concat([]byte{0x00, 0x01, 0x08, 0x00, 6, 4, 0x00, 0x01}, make([]byte, 20)),
+			wantAccept: false,
+		},
+		{
+			// The version decides the layout read: an IPv4 port offset is computed, an IPv6 one
+			// fixed. A packet with the other version's nibble is read with the other layout.
+			name:       "an ipv4 packet with an unknown version nibble",
+			data:       append([]byte{0x55}, ipv4Packet(protocolTcp, 0, 5, tcpSegment(replyFilterTestPort))[1:]...),
 			wantAccept: false,
 		},
 	}
@@ -119,7 +127,7 @@ func TestReplyFilterAcceptsAndRejects(t *testing.T) {
 		t.Run(testCase.name, func(t *testing.T) {
 			t.Parallel()
 
-			accepted, err := vm.Run(testCase.frame)
+			accepted, err := vm.Run(testCase.data)
 			if err != nil {
 				t.Fatalf("vm.Run: %v", err)
 			}

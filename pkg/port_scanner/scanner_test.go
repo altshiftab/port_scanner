@@ -15,8 +15,7 @@ import (
 
 	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
 	"github.com/altshiftab/utils_go/pkg/errors/types/nil_error"
-	"github.com/gopacket/gopacket"
-	"github.com/gopacket/gopacket/layers"
+	"github.com/altshiftab/utils_go/pkg/net/packet"
 
 	portScannerErrors "github.com/altshiftab/port_scanner/pkg/errors"
 	"github.com/altshiftab/port_scanner/pkg/port_scanner/port_scanner_config"
@@ -38,7 +37,7 @@ var (
 )
 
 // synAckFor builds the SYN/ACK a target would send in answer to a probe.
-func synAckFor(t *testing.T, probe *sentProbe, linkType layers.LinkType) []byte {
+func synAckFor(t *testing.T, probe *sentProbe) []byte {
 	t.Helper()
 
 	destinationIp := testSourceIp
@@ -47,13 +46,12 @@ func synAckFor(t *testing.T, probe *sentProbe, linkType layers.LinkType) []byte 
 	}
 
 	return buildPacket(t, &packetSpec{
-		linkType:      linkType,
 		sourceIp:      probe.destination.String(),
 		destinationIp: destinationIp,
-		sourcePort:    uint16(probe.tcp.DstPort),
-		destPort:      uint16(probe.tcp.SrcPort),
+		sourcePort:    probe.tcp.DestinationPort,
+		destPort:      probe.tcp.SourcePort,
 		seq:           777,
-		ack:           probe.tcp.Seq + 1,
+		ack:           probe.tcp.Sequence + 1,
 		syn:           true,
 		ackFlag:       true,
 	})
@@ -71,7 +69,7 @@ type testScanner struct {
 func newTestScanner(t *testing.T, options ...port_scanner_config.Option) *testScanner {
 	t.Helper()
 
-	source := newFakePacketSource(layers.LinkTypeEthernet)
+	source := newFakePacketSource()
 	t.Cleanup(source.close)
 
 	ipv4Conn := &fakePacketConn{}
@@ -124,9 +122,9 @@ func TestScanReportsOpenPorts(t *testing.T) {
 
 	testScanner := newTestScanner(t)
 	answer := func(probe *sentProbe) {
-		key := net.JoinHostPort(probe.destination.String(), strconv.Itoa(int(probe.tcp.DstPort)))
+		key := net.JoinHostPort(probe.destination.String(), strconv.Itoa(int(probe.tcp.DestinationPort)))
 		if open[key] {
-			testScanner.source.inject(synAckFor(t, probe, layers.LinkTypeEthernet))
+			testScanner.source.inject(synAckFor(t, probe))
 		}
 	}
 	testScanner.ipv4Conn.onSend = answer
@@ -151,13 +149,13 @@ func TestScanReportsOpenPorts(t *testing.T) {
 	}
 	seen := make(map[string]int)
 	for _, probe := range sent {
-		if probe.tcp.SrcPort != testListenPort {
-			t.Errorf("probe source port = %d, want %d", probe.tcp.SrcPort, testListenPort)
+		if probe.tcp.SourcePort != testListenPort {
+			t.Errorf("probe source port = %d, want %d", probe.tcp.SourcePort, testListenPort)
 		}
-		if !probe.tcp.SYN || probe.tcp.ACK {
-			t.Errorf("probe flags SYN=%v ACK=%v, want a bare SYN", probe.tcp.SYN, probe.tcp.ACK)
+		if probe.tcp.Flags != packet.TcpFlagSyn {
+			t.Errorf("probe flags = %#x, want a bare SYN", probe.tcp.Flags)
 		}
-		seen[net.JoinHostPort(probe.destination.String(), strconv.Itoa(int(probe.tcp.DstPort)))]++
+		seen[net.JoinHostPort(probe.destination.String(), strconv.Itoa(int(probe.tcp.DestinationPort)))]++
 	}
 	for key, count := range seen {
 		if count != 1 {
@@ -193,8 +191,8 @@ func TestScanSequenceNumbersEncodeSlots(t *testing.T) {
 
 	base := testScanner.scanner.sequenceBase
 	for _, probe := range testScanner.ipv4Conn.sentProbes() {
-		if slot := probe.tcp.Seq - base; slot >= concurrency {
-			t.Errorf("probe sequence number %d names slot %d, outside [0, %d)", probe.tcp.Seq, slot, concurrency)
+		if slot := probe.tcp.Sequence - base; slot >= concurrency {
+			t.Errorf("probe sequence number %d names slot %d, outside [0, %d)", probe.tcp.Sequence, slot, concurrency)
 		}
 	}
 }
@@ -210,9 +208,9 @@ func TestScanIgnoresRepliesThatMatchNoProbe(t *testing.T) {
 			name: "retransmitted syn/ack is reported once",
 			mangle: func(probe *sentProbe) *packetSpec {
 				return &packetSpec{
-					linkType: layers.LinkTypeEthernet, sourceIp: probe.destination.String(), destinationIp: testSourceIp,
-					sourcePort: uint16(probe.tcp.DstPort), destPort: uint16(probe.tcp.SrcPort),
-					ack: probe.tcp.Seq + 1, syn: true, ackFlag: true,
+					sourceIp: probe.destination.String(), destinationIp: testSourceIp,
+					sourcePort: probe.tcp.DestinationPort, destPort: probe.tcp.SourcePort,
+					ack: probe.tcp.Sequence + 1, syn: true, ackFlag: true,
 				}
 			},
 		},
@@ -220,9 +218,9 @@ func TestScanIgnoresRepliesThatMatchNoProbe(t *testing.T) {
 			name: "wrong source port",
 			mangle: func(probe *sentProbe) *packetSpec {
 				return &packetSpec{
-					linkType: layers.LinkTypeEthernet, sourceIp: probe.destination.String(), destinationIp: testSourceIp,
-					sourcePort: uint16(probe.tcp.DstPort) + 1, destPort: uint16(probe.tcp.SrcPort),
-					ack: probe.tcp.Seq + 1, syn: true, ackFlag: true,
+					sourceIp: probe.destination.String(), destinationIp: testSourceIp,
+					sourcePort: probe.tcp.DestinationPort + 1, destPort: probe.tcp.SourcePort,
+					ack: probe.tcp.Sequence + 1, syn: true, ackFlag: true,
 				}
 			},
 		},
@@ -230,9 +228,9 @@ func TestScanIgnoresRepliesThatMatchNoProbe(t *testing.T) {
 			name: "wrong source address",
 			mangle: func(probe *sentProbe) *packetSpec {
 				return &packetSpec{
-					linkType: layers.LinkTypeEthernet, sourceIp: "198.51.100.1", destinationIp: testSourceIp,
-					sourcePort: uint16(probe.tcp.DstPort), destPort: uint16(probe.tcp.SrcPort),
-					ack: probe.tcp.Seq + 1, syn: true, ackFlag: true,
+					sourceIp: "198.51.100.1", destinationIp: testSourceIp,
+					sourcePort: probe.tcp.DestinationPort, destPort: probe.tcp.SourcePort,
+					ack: probe.tcp.Sequence + 1, syn: true, ackFlag: true,
 				}
 			},
 		},
@@ -240,9 +238,9 @@ func TestScanIgnoresRepliesThatMatchNoProbe(t *testing.T) {
 			name: "acknowledgement names no slot",
 			mangle: func(probe *sentProbe) *packetSpec {
 				return &packetSpec{
-					linkType: layers.LinkTypeEthernet, sourceIp: probe.destination.String(), destinationIp: testSourceIp,
-					sourcePort: uint16(probe.tcp.DstPort), destPort: uint16(probe.tcp.SrcPort),
-					ack: probe.tcp.Seq + 1000, syn: true, ackFlag: true,
+					sourceIp: probe.destination.String(), destinationIp: testSourceIp,
+					sourcePort: probe.tcp.DestinationPort, destPort: probe.tcp.SourcePort,
+					ack: probe.tcp.Sequence + 1000, syn: true, ackFlag: true,
 				}
 			},
 		},
@@ -250,9 +248,9 @@ func TestScanIgnoresRepliesThatMatchNoProbe(t *testing.T) {
 			name: "acknowledgement of the sequence number itself",
 			mangle: func(probe *sentProbe) *packetSpec {
 				return &packetSpec{
-					linkType: layers.LinkTypeEthernet, sourceIp: probe.destination.String(), destinationIp: testSourceIp,
-					sourcePort: uint16(probe.tcp.DstPort), destPort: uint16(probe.tcp.SrcPort),
-					ack: probe.tcp.Seq, syn: true, ackFlag: true,
+					sourceIp: probe.destination.String(), destinationIp: testSourceIp,
+					sourcePort: probe.tcp.DestinationPort, destPort: probe.tcp.SourcePort,
+					ack: probe.tcp.Sequence, syn: true, ackFlag: true,
 				}
 			},
 		},
@@ -260,9 +258,9 @@ func TestScanIgnoresRepliesThatMatchNoProbe(t *testing.T) {
 			name: "rst/ack",
 			mangle: func(probe *sentProbe) *packetSpec {
 				return &packetSpec{
-					linkType: layers.LinkTypeEthernet, sourceIp: probe.destination.String(), destinationIp: testSourceIp,
-					sourcePort: uint16(probe.tcp.DstPort), destPort: uint16(probe.tcp.SrcPort),
-					ack: probe.tcp.Seq + 1, rst: true, ackFlag: true,
+					sourceIp: probe.destination.String(), destinationIp: testSourceIp,
+					sourcePort: probe.tcp.DestinationPort, destPort: probe.tcp.SourcePort,
+					ack: probe.tcp.Sequence + 1, rst: true, ackFlag: true,
 				}
 			},
 		},
@@ -276,7 +274,7 @@ func TestScanIgnoresRepliesThatMatchNoProbe(t *testing.T) {
 			testScanner.ipv4Conn.onSend = func(probe *sentProbe) {
 				// The genuine reply first, then the mangled one, twice, so that a duplicate as
 				// well as each kind of mismatch is exercised against a slot that is still held.
-				testScanner.source.inject(synAckFor(t, probe, layers.LinkTypeEthernet))
+				testScanner.source.inject(synAckFor(t, probe))
 				testScanner.source.inject(buildPacket(t, testCase.mangle(probe)))
 				testScanner.source.inject(buildPacket(t, testCase.mangle(probe)))
 			}
@@ -325,7 +323,7 @@ func TestScanFreesSlotsOnReply(t *testing.T) {
 	// less than a timeout per target.
 	testScanner := newTestScanner(t, port_scanner_config.WithConcurrency(1), port_scanner_config.WithTimeout(time.Second))
 	testScanner.ipv4Conn.onSend = func(probe *sentProbe) {
-		testScanner.source.inject(synAckFor(t, probe, layers.LinkTypeEthernet))
+		testScanner.source.inject(synAckFor(t, probe))
 	}
 
 	start := time.Now()
@@ -435,7 +433,7 @@ func TestScanSkipsTargetsWhoseProbeCannotBeSent(t *testing.T) {
 	testScanner := newTestScanner(t)
 	testScanner.ipv4Conn.writeErr = syscall.EPERM
 	testScanner.ipv6Conn.onSend = func(probe *sentProbe) {
-		testScanner.source.inject(synAckFor(t, probe, layers.LinkTypeEthernet))
+		testScanner.source.inject(synAckFor(t, probe))
 	}
 
 	networks := []*net.IPNet{mustParseCidr(t, "192.0.2.0/30"), mustParseCidr(t, "2001:db8::1/128")}
@@ -482,15 +480,14 @@ type erroringPacketSource struct {
 
 func (source *erroringPacketSource) Closed() bool { return false }
 
-func (source *erroringPacketSource) LinkType() layers.LinkType { return layers.LinkTypeEthernet }
-func (source *erroringPacketSource) ReadPacketData() ([]byte, gopacket.CaptureInfo, error) {
-	return nil, gopacket.CaptureInfo{}, source.err
+func (source *erroringPacketSource) ReadPacketData() ([]byte, error) {
+	return nil, source.err
 }
 
 func TestScanContinuesWhenOnePacketSourceFails(t *testing.T) {
 	t.Parallel()
 
-	good := newFakePacketSource(layers.LinkTypeEthernet)
+	good := newFakePacketSource()
 	t.Cleanup(good.close)
 	bad := &erroringPacketSource{err: errCaptureBroke}
 
@@ -509,7 +506,7 @@ func TestScanContinuesWhenOnePacketSourceFails(t *testing.T) {
 	}
 	scanner.resolveSourceIp = fixedSourceIp(testSourceIp)
 	ipv4Conn.onSend = func(probe *sentProbe) {
-		good.inject(synAckFor(t, probe, layers.LinkTypeEthernet))
+		good.inject(synAckFor(t, probe))
 	}
 
 	if err := scanner.Scan(context.Background(), []*net.IPNet{mustParseCidr(t, "192.0.2.0/30")}, []int{80}); err != nil {
@@ -525,9 +522,9 @@ func TestScanDeduplicatesAcrossPacketSources(t *testing.T) {
 	t.Parallel()
 
 	// The same reply seen on two interfaces is one result.
-	first := newFakePacketSource(layers.LinkTypeEthernet)
+	first := newFakePacketSource()
 	t.Cleanup(first.close)
-	second := newFakePacketSource(layers.LinkTypeEthernet)
+	second := newFakePacketSource()
 	t.Cleanup(second.close)
 
 	ipv4Conn := &fakePacketConn{}
@@ -545,7 +542,7 @@ func TestScanDeduplicatesAcrossPacketSources(t *testing.T) {
 	}
 	scanner.resolveSourceIp = fixedSourceIp(testSourceIp)
 	ipv4Conn.onSend = func(probe *sentProbe) {
-		reply := synAckFor(t, probe, layers.LinkTypeEthernet)
+		reply := synAckFor(t, probe)
 		first.inject(reply)
 		second.inject(reply)
 	}
@@ -612,7 +609,7 @@ func TestScanSkipsUnroutableTargets(t *testing.T) {
 		return net.ParseIP(testSourceIp).To4(), nil
 	}
 	testScanner.ipv4Conn.onSend = func(probe *sentProbe) {
-		testScanner.source.inject(synAckFor(t, probe, layers.LinkTypeEthernet))
+		testScanner.source.inject(synAckFor(t, probe))
 	}
 
 	networks := []*net.IPNet{unroutable, mustParseCidr(t, "192.0.2.0/30")}
@@ -723,7 +720,7 @@ func TestNewScannerValidation(t *testing.T) {
 
 	listenHandler := &listener_handler.ListenHandler{ListenPort: testListenPort, TcpIpv4Connection: &fakePacketConn{}}
 	callback := func(*Result) {}
-	source := newFakePacketSource(layers.LinkTypeEthernet)
+	source := newFakePacketSource()
 	t.Cleanup(source.close)
 
 	// The largest int; beyond a sequence number on 64-bit platforms, where the case applies.
@@ -836,7 +833,7 @@ func TestScanCallbacksFinishBeforeReturn(t *testing.T) {
 	var inFlight atomic.Int32
 	var finished atomic.Int32
 
-	source := newFakePacketSource(layers.LinkTypeEthernet)
+	source := newFakePacketSource()
 	t.Cleanup(source.close)
 	ipv4Conn := &fakePacketConn{}
 	listenHandler := &listener_handler.ListenHandler{ListenPort: testListenPort, TcpIpv4Connection: ipv4Conn}
@@ -857,7 +854,7 @@ func TestScanCallbacksFinishBeforeReturn(t *testing.T) {
 	}
 	scanner.resolveSourceIp = fixedSourceIp(testSourceIp)
 	ipv4Conn.onSend = func(probe *sentProbe) {
-		source.inject(synAckFor(t, probe, layers.LinkTypeEthernet))
+		source.inject(synAckFor(t, probe))
 	}
 
 	if err := scanner.Scan(context.Background(), []*net.IPNet{mustParseCidr(t, "192.0.2.0/29")}, []int{80}); err != nil {

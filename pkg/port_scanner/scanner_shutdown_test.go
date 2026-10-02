@@ -8,9 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/gopacket/gopacket"
-	"github.com/gopacket/gopacket/layers"
-
 	"github.com/altshiftab/port_scanner/pkg/port_scanner/port_scanner_config"
 	"github.com/altshiftab/port_scanner/pkg/types/listener_handler"
 )
@@ -43,16 +40,14 @@ func newBlockingPacketSource() *blockingPacketSource {
 
 func (source *blockingPacketSource) Closed() bool { return source.closed.Load() }
 
-func (source *blockingPacketSource) LinkType() layers.LinkType { return layers.LinkTypeEthernet }
-
-func (source *blockingPacketSource) ReadPacketData() ([]byte, gopacket.CaptureInfo, error) {
+func (source *blockingPacketSource) ReadPacketData() ([]byte, error) {
 	source.readingOn.Do(func() { close(source.reading) })
 
 	select {
 	case <-source.done:
-		return nil, gopacket.CaptureInfo{}, io.EOF
+		return nil, io.EOF
 	case data := <-source.packets:
-		return data, gopacket.CaptureInfo{CaptureLength: len(data), Length: len(data)}, nil
+		return data, nil
 	}
 }
 

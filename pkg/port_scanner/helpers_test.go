@@ -5,210 +5,142 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/gopacket/gopacket"
-	"github.com/gopacket/gopacket/layers"
+	"github.com/altshiftab/utils_go/pkg/net/packet"
 )
-
-var errFakeSourceDrained = errors.New("fake packet source drained")
 
 // packetSpec describes a packet to build for a test.
 type packetSpec struct {
-	linkType layers.LinkType
-	vlan     bool
 	// ipv6DestinationOptions inserts a Destination Options extension header between the IPv6
 	// header and the transport header.
 	ipv6DestinationOptions bool
-	sourceIp               string
-	destinationIp          string
-	sourcePort             uint16
-	destPort               uint16
-	seq                    uint32
-	ack                    uint32
-	syn                    bool
-	ackFlag                bool
-	rst                    bool
-	udp                    bool
-	payload                []byte
+	// laterFragment marks the packet as a fragment other than the first.
+	laterFragment bool
+	sourceIp      string
+	destinationIp string
+	sourcePort    uint16
+	destPort      uint16
+	seq           uint32
+	ack           uint32
+	syn           bool
+	ackFlag       bool
+	rst           bool
+	udp           bool
+	payload       []byte
 }
 
-// buildPacket serializes the described packet with the framing its link type calls for.
+// buildPacket serializes the described packet from its IP header on, as a capture handle delivers
+// it.
 func buildPacket(t *testing.T, spec *packetSpec) []byte {
 	t.Helper()
 
-	sourceIp := net.ParseIP(spec.sourceIp)
-	destinationIp := net.ParseIP(spec.destinationIp)
-	if sourceIp == nil || destinationIp == nil {
-		t.Fatalf("bad addresses %q, %q", spec.sourceIp, spec.destinationIp)
+	source, err := netip.ParseAddr(spec.sourceIp)
+	if err != nil {
+		t.Fatalf("parse source address: %v", err)
+	}
+	destination, err := netip.ParseAddr(spec.destinationIp)
+	if err != nil {
+		t.Fatalf("parse destination address: %v", err)
 	}
 
-	var stack []gopacket.SerializableLayer
-	var networkLayer gopacket.NetworkLayer
-	var etherType layers.EthernetType
-	var ipProtocol layers.IPProtocol
-
+	var transport []byte
+	protocol := packet.ProtocolTcp
 	if spec.udp {
-		ipProtocol = layers.IPProtocolUDP
+		// Source port, destination port, length and a zero (absent) checksum.
+		protocol = packet.ProtocolUdp
+		transport = binary.BigEndian.AppendUint16(nil, spec.sourcePort)
+		transport = binary.BigEndian.AppendUint16(transport, spec.destPort)
+		transport = binary.BigEndian.AppendUint16(transport, uint16(8+len(spec.payload))) //nolint:gosec // Test payloads are small.
+		transport = append(transport, 0, 0)
+		transport = append(transport, spec.payload...)
 	} else {
-		ipProtocol = layers.IPProtocolTCP
+		var flags packet.TcpFlags
+		if spec.syn {
+			flags |= packet.TcpFlagSyn
+		}
+		if spec.ackFlag {
+			flags |= packet.TcpFlagAck
+		}
+		if spec.rst {
+			flags |= packet.TcpFlagRst
+		}
+
+		transport, err = packet.AppendTcp(nil, &packet.Tcp{
+			SourcePort:      spec.sourcePort,
+			DestinationPort: spec.destPort,
+			Sequence:        spec.seq,
+			Acknowledgement: spec.ack,
+			Flags:           flags,
+			Window:          65535,
+			Payload:         spec.payload,
+		}, source, destination)
+		if err != nil {
+			t.Fatalf("append tcp: %v", err)
+		}
 	}
 
-	var extensionLayers []gopacket.SerializableLayer
-	if sourceIp.To4() != nil {
-		etherType = layers.EthernetTypeIPv4
-		networkLayer = &layers.IPv4{
-			Version: 4, TTL: 64, Protocol: ipProtocol, SrcIP: sourceIp.To4(), DstIP: destinationIp.To4(),
+	ip := &packet.Ip{Source: source, Destination: destination, Protocol: protocol, Payload: transport}
+	if source.Is4() {
+		ip.Version = 4
+		if spec.laterFragment {
+			ip.FragmentOffset = 1480
 		}
 	} else {
-		etherType = layers.EthernetTypeIPv6
-		nextHeader := ipProtocol
+		ip.Version = 6
 		if spec.ipv6DestinationOptions {
-			nextHeader = layers.IPProtocolIPv6Destination
-			// A PadN option of four bytes brings the header to the eight-byte multiple it must be.
-			destinationOptions := &layers.IPv6Destination{
-				Options: []*layers.IPv6DestinationOption{{OptionType: 1, OptionLength: 4, OptionData: make([]byte, 4)}},
-			}
-			destinationOptions.NextHeader = ipProtocol
-			extensionLayers = append(extensionLayers, destinationOptions)
+			// Next header, length 0 (eight bytes), and a PadN option filling the rest.
+			ip.Payload = append([]byte{protocol, 0, 1, 4, 0, 0, 0, 0}, transport...)
+			ip.Protocol = packet.ProtocolIpv6DestinationOptions
 		}
-		networkLayer = &layers.IPv6{
-			Version: 6, HopLimit: 64, NextHeader: nextHeader, SrcIP: sourceIp, DstIP: destinationIp,
+		if spec.laterFragment {
+			// Next header, reserved, offset 185 eight-byte units, identification.
+			ip.Payload = append([]byte{ip.Protocol, 0, 0x05, 0xc8, 0, 0, 0, 1}, ip.Payload...)
+			ip.Protocol = packet.ProtocolIpv6Fragment
 		}
 	}
 
-	switch spec.linkType {
-	case layers.LinkTypeEthernet:
-		if spec.vlan {
-			stack = append(stack,
-				&layers.Ethernet{
-					SrcMAC:       net.HardwareAddr{2, 0, 0, 0, 0, 1},
-					DstMAC:       net.HardwareAddr{2, 0, 0, 0, 0, 2},
-					EthernetType: layers.EthernetTypeDot1Q,
-				},
-				&layers.Dot1Q{VLANIdentifier: 7, Type: etherType},
-			)
-		} else {
-			stack = append(stack, &layers.Ethernet{
-				SrcMAC:       net.HardwareAddr{2, 0, 0, 0, 0, 1},
-				DstMAC:       net.HardwareAddr{2, 0, 0, 0, 0, 2},
-				EthernetType: etherType,
-			})
-		}
-	case layers.LinkTypeLinuxSLL, layers.LinkTypeLinuxSLL2:
-		// gopacket decodes but does not serialize Linux cooked capture; its header is prepended
-		// by hand below.
-	default:
-		// Bare IP: no link-layer framing.
+	data, err := packet.AppendIp(nil, ip)
+	if err != nil {
+		t.Fatalf("append ip: %v", err)
 	}
 
-	serializable, ok := networkLayer.(gopacket.SerializableLayer)
-	if !ok {
-		t.Fatalf("network layer is not serializable")
-	}
-	stack = append(stack, serializable)
-	stack = append(stack, extensionLayers...)
-
-	if spec.udp {
-		udp := &layers.UDP{SrcPort: layers.UDPPort(spec.sourcePort), DstPort: layers.UDPPort(spec.destPort)}
-		if err := udp.SetNetworkLayerForChecksum(networkLayer); err != nil {
-			t.Fatalf("SetNetworkLayerForChecksum() error = %v", err)
-		}
-		stack = append(stack, udp)
-	} else {
-		tcp := &layers.TCP{
-			SrcPort: layers.TCPPort(spec.sourcePort),
-			DstPort: layers.TCPPort(spec.destPort),
-			Seq:     spec.seq,
-			Ack:     spec.ack,
-			SYN:     spec.syn,
-			ACK:     spec.ackFlag,
-			RST:     spec.rst,
-			Window:  65535,
-		}
-		if err := tcp.SetNetworkLayerForChecksum(networkLayer); err != nil {
-			t.Fatalf("SetNetworkLayerForChecksum() error = %v", err)
-		}
-		stack = append(stack, tcp)
-	}
-
-	if len(spec.payload) != 0 {
-		stack = append(stack, gopacket.Payload(spec.payload))
-	}
-
-	buffer := gopacket.NewSerializeBuffer()
-	options := gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
-	if err := gopacket.SerializeLayers(buffer, options, stack...); err != nil {
-		t.Fatalf("SerializeLayers() error = %v", err)
-	}
-
-	switch spec.linkType {
-	case layers.LinkTypeLinuxSLL:
-		// Packet type (2), ARPHRD type (2), address length (2), address (8), protocol (2).
-		header := []byte{
-			0x00, 0x00, // packet type: to us
-			0x00, 0x01, // ARPHRD_ETHER
-			0x00, 0x06, // address length
-			0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, // address, padded
-		}
-		header = binary.BigEndian.AppendUint16(header, uint16(etherType)) // protocol
-
-		return append(header, buffer.Bytes()...)
-	case layers.LinkTypeLinuxSLL2:
-		// Protocol (2), reserved (2), interface index (4), ARPHRD type (2), packet type (1),
-		// address length (1), address (8).
-		header := binary.BigEndian.AppendUint16(nil, uint16(etherType))
-		header = append(header,
-			0x00, 0x00, // reserved
-			0x00, 0x00, 0x00, 0x02, // interface index
-			0x00, 0x01, // ARPHRD_ETHER
-			0x00,                                           // packet type: to us
-			0x06,                                           // address length
-			0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, // address, padded
-		)
-
-		return append(header, buffer.Bytes()...)
-	default:
-		return buffer.Bytes()
-	}
+	return data
 }
 
-// fakePacketSource hands out queued packets and behaves like an idle capture handle otherwise:
-// reads time out until it is closed, after which they report EOF.
+// fakePacketSource hands out queued packets and behaves like an idle capture handle otherwise: a
+// read blocks until a packet is queued or the source is closed, after which reads report EOF.
+//
+// It does not give up on its own. A source that reported itself done after a quiet spell would
+// end its reader mid-scan whenever the sender was slow to send the next probe -- under the race
+// detector, routinely -- and the replies that followed would go unheard.
 type fakePacketSource struct {
-	closed   atomic.Bool
-	linkType layers.LinkType
-	packets  chan []byte
-	done     chan struct{}
-	once     sync.Once
+	closed  atomic.Bool
+	packets chan []byte
+	done    chan struct{}
+	once    sync.Once
 }
 
-func newFakePacketSource(linkType layers.LinkType) *fakePacketSource {
+func newFakePacketSource() *fakePacketSource {
 	return &fakePacketSource{
-		linkType: linkType,
-		packets:  make(chan []byte, 1024),
-		done:     make(chan struct{}),
+		packets: make(chan []byte, 1024),
+		done:    make(chan struct{}),
 	}
 }
 
 func (source *fakePacketSource) Closed() bool { return source.closed.Load() }
 
-func (source *fakePacketSource) LinkType() layers.LinkType {
-	return source.linkType
-}
-
-func (source *fakePacketSource) ReadPacketData() ([]byte, gopacket.CaptureInfo, error) {
+func (source *fakePacketSource) ReadPacketData() ([]byte, error) {
 	select {
 	case <-source.done:
-		return nil, gopacket.CaptureInfo{}, io.EOF
+		return nil, io.EOF
 	case data := <-source.packets:
-		return data, gopacket.CaptureInfo{CaptureLength: len(data), Length: len(data)}, nil
-	case <-time.After(5 * time.Millisecond):
-		source.closed.Store(true)
-		return nil, gopacket.CaptureInfo{}, errFakeSourceDrained
+		return data, nil
 	}
 }
 
@@ -217,7 +149,10 @@ func (source *fakePacketSource) inject(data []byte) {
 }
 
 func (source *fakePacketSource) close() {
-	source.once.Do(func() { close(source.done) })
+	source.once.Do(func() {
+		source.closed.Store(true)
+		close(source.done)
+	})
 }
 
 var errNotAnIpAddress = errors.New("address is not an ip address")
@@ -225,7 +160,7 @@ var errNotAnIpAddress = errors.New("address is not an ip address")
 // sentProbe is a probe as a fakePacketConn saw it: the segment decoded, and where it went.
 type sentProbe struct {
 	destination net.IP
-	tcp         layers.TCP
+	tcp         *packet.Tcp
 }
 
 // fakePacketConn stands in for a raw socket. It decodes each written segment and hands it to
@@ -255,8 +190,8 @@ func (conn *fakePacketConn) WriteTo(data []byte, address net.Addr) (int, error) 
 		return 0, errNotAnIpAddress
 	}
 
-	var tcp layers.TCP
-	if err := tcp.DecodeFromBytes(data, gopacket.NilDecodeFeedback); err != nil {
+	tcp, err := packet.ParseTcp(slices.Clone(data))
+	if err != nil {
 		return 0, err
 	}
 

@@ -3,12 +3,11 @@ package port_scanner
 import (
 	"fmt"
 	"net"
+	"net/netip"
 
 	altshiftErrors "github.com/altshiftab/utils_go/pkg/errors"
-	"github.com/altshiftab/utils_go/pkg/errors/types/empty_error"
 	"github.com/altshiftab/utils_go/pkg/errors/types/nil_error"
-	"github.com/gopacket/gopacket"
-	"github.com/gopacket/gopacket/layers"
+	"github.com/altshiftab/utils_go/pkg/net/packet"
 
 	portScannerErrors "github.com/altshiftab/port_scanner/pkg/errors"
 )
@@ -20,17 +19,13 @@ const (
 	// probeMss is the maximum segment size option a probe carries, so that it looks like an
 	// ordinary connection attempt.
 	probeMss = 1460
-	// probeTtl is the TTL / hop limit written into the network layer of a probe. That layer is not
-	// what goes on the wire — the kernel builds the real IP header, with its own TTL — it only
-	// supplies the checksum pseudo-header, in which the TTL plays no part; the value is nominal.
-	probeTtl = 255
+	// tcpOptionKindMss and tcpOptionLengthMss make up the MSS option's kind and length bytes.
+	tcpOptionKindMss   = 2
+	tcpOptionLengthMss = 4
 )
 
-var serializeOptions = gopacket.SerializeOptions{FixLengths: true, ComputeChecksums: true}
-
-// NewProbeTcpLayer returns the TCP layer of a SYN probe from sourcePort to destinationPort with
-// the given sequence number.
-func NewProbeTcpLayer(sourcePort int, destinationPort int, sequenceNumber uint32) (*layers.TCP, error) {
+// NewProbe returns a SYN probe from sourcePort to destinationPort with the given sequence number.
+func NewProbe(sourcePort int, destinationPort int, sequenceNumber uint32) (*packet.Tcp, error) {
 	for _, port := range []int{sourcePort, destinationPort} {
 		if port < 1 || port > maxPort {
 			return nil, altshiftErrors.NewWithTrace(
@@ -40,112 +35,55 @@ func NewProbeTcpLayer(sourcePort int, destinationPort int, sequenceNumber uint32
 		}
 	}
 
-	return &layers.TCP{
-		SrcPort: layers.TCPPort(sourcePort),      //nolint:gosec // Range checked above.
-		DstPort: layers.TCPPort(destinationPort), //nolint:gosec // Range checked above.
-		Seq:     sequenceNumber,
-		Window:  probeWindow,
-		SYN:     true,
-		Options: []layers.TCPOption{
-			{
-				OptionType:   layers.TCPOptionKindMSS,
-				OptionLength: 4,
-				OptionData:   []byte{probeMss >> 8, probeMss & 0xff},
-			},
-		},
+	return &packet.Tcp{
+		SourcePort:      uint16(sourcePort),      //nolint:gosec // Range checked above.
+		DestinationPort: uint16(destinationPort), //nolint:gosec // Range checked above.
+		Sequence:        sequenceNumber,
+		Flags:           packet.TcpFlagSyn,
+		Window:          probeWindow,
+		Options:         []byte{tcpOptionKindMss, tcpOptionLengthMss, probeMss >> 8, probeMss & 0xff},
 	}, nil
 }
 
-// NewProbeNetworkLayer returns the network layer of a probe from sourceIp to destinationIp. The
-// layer is not sent: the raw sockets have the kernel build the IP header. It supplies the checksum
-// pseudo-header, which is why its source address must be the one the kernel will use.
-func NewProbeNetworkLayer(sourceIp net.IP, destinationIp net.IP) (gopacket.NetworkLayer, error) {
-	if len(sourceIp) == 0 {
-		return nil, altshiftErrors.NewWithTrace(empty_error.New("source ip"))
+// probeAddress converts an address to the form a probe's checksum is computed over: an IPv4
+// address as IPv4, however net stored it.
+func probeAddress(ip net.IP) (netip.Addr, error) {
+	address, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return netip.Addr{}, altshiftErrors.NewWithTrace(portScannerErrors.ErrUnsupportedNetworkLayer, ip)
 	}
 
-	if len(destinationIp) == 0 {
-		return nil, altshiftErrors.NewWithTrace(empty_error.New("destination ip"))
-	}
-
-	if destinationIp.To4() != nil {
-		return &layers.IPv4{
-			Version:  4,
-			TTL:      probeTtl,
-			Protocol: layers.IPProtocolTCP,
-			SrcIP:    sourceIp,
-			DstIP:    destinationIp,
-		}, nil
-	}
-
-	if destinationIp.To16() != nil {
-		return &layers.IPv6{
-			Version:    6,
-			HopLimit:   probeTtl,
-			NextHeader: layers.IPProtocolTCP,
-			SrcIP:      sourceIp,
-			DstIP:      destinationIp,
-		}, nil
-	}
-
-	return nil, altshiftErrors.NewWithTrace(portScannerErrors.ErrUnsupportedNetworkLayer, destinationIp)
+	return address.Unmap(), nil
 }
 
-// SendTcpPacket serializes the TCP layer, with its checksum computed over networkLayer, and writes
-// it to the network layer's destination through connection, a raw socket of the matching family.
+// SendTcpPacket encodes the segment, with its checksum computed over the pseudo-header of source
+// and destination, into buffer and writes it to destination through connection, a raw socket of
+// the matching family; the kernel builds the IP header. Source must be the address the kernel will
+// send from, or the checksum will not hold. The buffer is returned for the next call to reuse.
 func SendTcpPacket(
-	tcpLayer *layers.TCP,
-	networkLayer gopacket.NetworkLayer,
+	tcp *packet.Tcp,
+	source netip.Addr,
+	destination netip.Addr,
 	connection net.PacketConn,
-	buffer gopacket.SerializeBuffer,
-) error {
-	if tcpLayer == nil {
-		return altshiftErrors.NewWithTrace(nil_error.New("tcp layer"))
-	}
-
-	if networkLayer == nil {
-		return altshiftErrors.NewWithTrace(nil_error.New("network layer"))
+	buffer []byte,
+) ([]byte, error) {
+	if tcp == nil {
+		return buffer, altshiftErrors.NewWithTrace(nil_error.New("tcp"))
 	}
 
 	if connection == nil {
-		return altshiftErrors.NewWithTrace(nil_error.New("connection"))
+		return buffer, altshiftErrors.NewWithTrace(nil_error.New("connection"))
 	}
 
-	if buffer == nil {
-		return altshiftErrors.NewWithTrace(nil_error.New("buffer"))
+	buffer, err := packet.AppendTcp(buffer[:0], tcp, source, destination)
+	if err != nil {
+		return buffer, altshiftErrors.NewWithTrace(fmt.Errorf("append tcp: %w", err), source, destination)
 	}
 
-	var destinationIp net.IP
-	switch typedNetworkLayer := networkLayer.(type) {
-	case *layers.IPv4:
-		destinationIp = typedNetworkLayer.DstIP
-	case *layers.IPv6:
-		destinationIp = typedNetworkLayer.DstIP
-	default:
-		return altshiftErrors.NewWithTrace(
-			fmt.Errorf("%w: %T", portScannerErrors.ErrUnsupportedNetworkLayer, networkLayer),
-		)
+	destinationIp := net.IP(destination.AsSlice())
+	if _, err := connection.WriteTo(buffer, &net.IPAddr{IP: destinationIp}); err != nil {
+		return buffer, altshiftErrors.NewWithTrace(fmt.Errorf("packet conn write to: %w", err), destinationIp)
 	}
 
-	if len(destinationIp) == 0 {
-		return altshiftErrors.NewWithTrace(empty_error.New("destination ip"))
-	}
-
-	if err := tcpLayer.SetNetworkLayerForChecksum(networkLayer); err != nil {
-		return altshiftErrors.NewWithTrace(fmt.Errorf("tcp layer set network layer for checksum: %w", err))
-	}
-
-	if err := buffer.Clear(); err != nil {
-		return altshiftErrors.NewWithTrace(fmt.Errorf("serialize buffer clear: %w", err))
-	}
-
-	if err := gopacket.SerializeLayers(buffer, serializeOptions, tcpLayer); err != nil {
-		return altshiftErrors.NewWithTrace(fmt.Errorf("gopacket serialize layers: %w", err))
-	}
-
-	if _, err := connection.WriteTo(buffer.Bytes(), &net.IPAddr{IP: destinationIp}); err != nil {
-		return altshiftErrors.NewWithTrace(fmt.Errorf("packet conn write to: %w", err), destinationIp)
-	}
-
-	return nil
+	return buffer, nil
 }

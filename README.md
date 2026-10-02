@@ -13,8 +13,11 @@ grants no `CAP_NET_RAW` and no `AF_PACKET`, so SYN mode cannot run there under a
 The costs are that it is slower, every filtered port costing a full connect timeout, and that the
 target sees and logs each connection.
 
-Pure Go, no cgo and no libpcap: capture is an `AF_PACKET` socket opened through `gopacket/pcapgo`,
-so `CGO_ENABLED=0` builds a static binary that drops into a `FROM scratch` image.
+Pure Go, no cgo and no libpcap: capture is an `AF_PACKET` socket opened directly, so
+`CGO_ENABLED=0` builds a static binary that drops into a `FROM scratch` image. The socket is of type
+`SOCK_DGRAM`, so the kernel strips each frame's link-layer header and every interface looks the
+same from the IP header on: Ethernet, a VLAN, loopback, and tunnels with no link-layer header at
+all, such as WireGuard and ipip. Packets are encoded and decoded with `utils_go/pkg/net/packet`.
 
 ## Command line
 
@@ -71,7 +74,8 @@ err := port_scanner.Scan(
 `Scan` sets up and tears down whatever the mode needs. `ScanNetworks` takes parsed `*net.IPNet`
 targets. For a SYN scan that reuses sockets and capture handles, or reads packets from somewhere
 other than an `AF_PACKET` socket, build a `Scanner` with `NewScanner` from a
-`listener_handler.ListenHandler` and `PacketSource`s.
+`listener_handler.ListenHandler` and `PacketSource`s. A `PacketSource` delivers each packet from
+its IP header on.
 
 ### Banners
 
@@ -129,7 +133,7 @@ reported — once for each.
 
 ## Shutdown
 
-An `AF_PACKET` read has no timeout: it returns when a frame arrives or when the handle is closed.
+An `AF_PACKET` read has no timeout: it returns when a packet arrives or when the handle is closed.
 Cancelling a scan therefore cannot wake a reader waiting on a quiet interface, and since a `Scanner`
 does not own its packet sources it cannot close them itself. So `Scan` gives its readers a moment
 and then returns, leaving any still parked to be freed by the caller closing the sources — which
@@ -147,6 +151,14 @@ custom-gcl run --config ~/.config/goland_go_linter/.golangci.yaml ./...
 
 Everything but the tests that need `CAP_NET_RAW` runs unprivileged: the probe/reply loop is
 exercised against fake sockets and capture sources, and the banner grabs against real loopback
-listeners. Run as root (`sudo -E "$(which go)" test ./...`) to also run the end-to-end scan of the
-loopback interface (`TestScanEndToEnd`) and the raw-socket and capture-handle setup; those tests
-skip themselves otherwise.
+listeners. Run with `CAP_NET_RAW` to also run the end-to-end scan of the loopback interface
+(`TestScanEndToEnd`) and the raw-socket and capture-handle tests; those tests skip themselves
+otherwise. Root of an unprivileged user and network namespace is enough, so no `sudo` is needed.
+The connect-mode tests expect a route out, which a fresh namespace lacks, so give it one:
+
+```
+unshare -rn sh -c 'ip link set lo up && ip link add dummy0 type dummy && ip link set dummy0 up &&
+  ip addr add 10.99.0.1/24 dev dummy0 && ip route add default via 10.99.0.2 &&
+  ip -6 addr add fd99::1/64 dev dummy0 nodad && ip -6 route add default via fd99::2 &&
+  go test -race ./...'
+```
